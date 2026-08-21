@@ -14,6 +14,7 @@ from __future__ import annotations
 import re
 import unicodedata
 from array import array
+from collections.abc import Iterator
 from dataclasses import dataclass
 from enum import StrEnum
 from io import StringIO
@@ -139,6 +140,26 @@ _TEXT_EXTENSIONS = frozenset(
 
 _ALLOWED_FORMAT_CHARS = frozenset({"\n", "\r", "\t"})
 _IGNORED_ASCII_CONTROL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+# Unicode 15.1.0 DerivedCoreProperties.txt: Default_Ignorable_Code_Point.
+_DEFAULT_IGNORABLE_RANGES = (
+    (0x00AD, 0x00AD),
+    (0x034F, 0x034F),
+    (0x061C, 0x061C),
+    (0x115F, 0x1160),
+    (0x17B4, 0x17B5),
+    (0x180B, 0x180F),
+    (0x200B, 0x200F),
+    (0x202A, 0x202E),
+    (0x2060, 0x206F),
+    (0x3164, 0x3164),
+    (0xFE00, 0xFE0F),
+    (0xFEFF, 0xFEFF),
+    (0xFFA0, 0xFFA0),
+    (0xFFF0, 0xFFF8),
+    (0x1BCA0, 0x1BCA3),
+    (0x1D173, 0x1D17A),
+    (0xE0000, 0xE0FFF),
+)
 
 
 def _suffix(path: str) -> str:
@@ -200,20 +221,94 @@ def decode_text(data: bytes) -> str:
     return data.decode("utf-8", errors="replace")
 
 
-def _is_ignored_format(ch: str) -> bool:
+def is_default_ignorable(ch: str) -> bool:
+    """Return the pinned Unicode Default_Ignorable_Code_Point property."""
+    codepoint = ord(ch)
+    for start, end in _DEFAULT_IGNORABLE_RANGES:
+        if codepoint < start:
+            return False
+        if codepoint <= end:
+            return True
+    return False
+
+
+def _is_unconditionally_ignored(ch: str) -> bool:
     return (
-        ch == "\u00ad"
+        bool(_IGNORED_ASCII_CONTROL.fullmatch(ch))
         or unicodedata.category(ch) in {"Cf", "Cc"}
         and ch not in _ALLOWED_FORMAT_CHARS
     )
+
+
+def _is_word_character(ch: str) -> bool:
+    return ch.isalnum() or ch == "_"
+
+
+def _is_non_ascii_separator(ch: str) -> bool:
+    return not ch.isascii() and unicodedata.category(ch).startswith("Z")
+
+
+def _is_token_gap_character(ch: str) -> bool:
+    return (
+        _is_unconditionally_ignored(ch)
+        or is_default_ignorable(ch)
+        or _is_non_ascii_separator(ch)
+        or ch == "\ufffd"
+    )
+
+
+def _token_bridging_gap_spans(
+    text: str,
+) -> Iterator[tuple[int, int]]:
+    """Yield word-bounded noise runs in one pass without crossing ASCII spaces."""
+    offset = 0
+    while offset < len(text):
+        if not _is_token_gap_character(text[offset]):
+            offset += 1
+            continue
+        start = offset
+        while offset < len(text) and _is_token_gap_character(text[offset]):
+            offset += 1
+        if (
+            start > 0
+            and offset < len(text)
+            and _is_word_character(text[start - 1])
+            and _is_word_character(text[offset])
+        ):
+            yield start, offset
+
+
+def _contextual_default_ignorable_offsets(text: str) -> Iterator[int]:
+    """Yield non-format default-ignorables only when they bridge word tokens."""
+    for start, end in _token_bridging_gap_spans(text):
+        for offset in range(start, end):
+            ch = text[offset]
+            if is_default_ignorable(ch) and not _is_unconditionally_ignored(ch):
+                yield offset
+
+
+def _compact_gap_offsets(text: str) -> Iterator[int]:
+    """Yield word-bounded separator runs that the compact view may remove."""
+    for start, end in _token_bridging_gap_spans(text):
+        if any(_is_non_ascii_separator(text[offset]) for offset in range(start, end)):
+            yield from range(start, end)
+
+
+def _next_offset(offsets: Iterator[int]) -> int | None:
+    return next(offsets, None)
 
 
 def normalized_security_view(text: str) -> SecurityTextView:
     """Build an NFKC/UTS #39 ASCII-skeleton view with compact offsets."""
     output = StringIO()
     offsets = array("I")
+    contextual_offsets = iter(_contextual_default_ignorable_offsets(text))
+    next_contextual = _next_offset(contextual_offsets)
     for source_offset, ch in enumerate(text):
-        if _is_ignored_format(ch):
+        is_contextual = source_offset == next_contextual
+        if is_contextual:
+            next_contextual = _next_offset(contextual_offsets)
+        if _is_unconditionally_ignored(ch) or is_contextual:
             continue
         normalized = unicodedata.normalize("NFKC", ch).translate(ASCII_CONFUSABLE_SKELETON)
         for normalized_char in normalized:
@@ -226,8 +321,18 @@ def compact_letter_view(text: str) -> SecurityTextView:
     """Remove compact binary/format noise between letters without joining words."""
     output = StringIO()
     offsets = array("I")
+    contextual_offsets = iter(_contextual_default_ignorable_offsets(text))
+    compact_offsets = iter(_compact_gap_offsets(text))
+    next_contextual = _next_offset(contextual_offsets)
+    next_compact = _next_offset(compact_offsets)
     for source_offset, ch in enumerate(text):
-        if _is_ignored_format(ch) or ch == "\ufffd":
+        is_contextual = source_offset == next_contextual
+        is_compact = source_offset == next_compact
+        if is_contextual:
+            next_contextual = _next_offset(contextual_offsets)
+        if is_compact:
+            next_compact = _next_offset(compact_offsets)
+        if _is_unconditionally_ignored(ch) or ch == "\ufffd" or is_contextual or is_compact:
             continue
         normalized = unicodedata.normalize("NFKC", ch).translate(ASCII_CONFUSABLE_SKELETON)
         for normalized_char in normalized:
@@ -244,7 +349,7 @@ def security_text_views(text: str) -> tuple[SecurityTextView, ...]:
     unique = [raw]
     seen = {text}
     builders = [normalized_security_view]
-    if "\ufffd" in text:
+    if "\ufffd" in text or _next_offset(iter(_compact_gap_offsets(text))) is not None:
         builders.append(compact_letter_view)
     for build_view in builders:
         view = build_view(text)
@@ -255,10 +360,18 @@ def security_text_views(text: str) -> tuple[SecurityTextView, ...]:
 
 
 def unicode_anomaly_density(text: str) -> float:
-    """Return the density of soft-hyphen/default-ignorable format characters."""
+    """Return the density of format controls and token-bridging ignorables."""
     if not text:
         return 0.0
-    return sum(_is_ignored_format(ch) for ch in text) / len(text)
+    contextual_offsets = iter(_contextual_default_ignorable_offsets(text))
+    next_contextual = _next_offset(contextual_offsets)
+    ignored = 0
+    for offset, ch in enumerate(text):
+        is_contextual = offset == next_contextual
+        if is_contextual:
+            next_contextual = _next_offset(contextual_offsets)
+        ignored += _is_unconditionally_ignored(ch) or is_contextual
+    return ignored / len(text)
 
 
 def has_mixed_script_token(text: str) -> bool:
