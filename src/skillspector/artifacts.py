@@ -140,7 +140,10 @@ _TEXT_EXTENSIONS = frozenset(
 
 _ALLOWED_FORMAT_CHARS = frozenset({"\n", "\r", "\t"})
 _IGNORED_ASCII_CONTROL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
-_LETTER_SPACING_CANDIDATE = re.compile(r"(?:[A-Za-z][^A-Za-z0-9\r\n]+){5}[A-Za-z]")
+_LETTER_SPACING_CANDIDATE = re.compile(
+    r"(?:[^\W\d_](?:[^\w\r\n]|_)+){5}[^\W\d_]",
+    re.UNICODE,
+)
 _MIN_LETTER_SPACING_RUN_LETTERS = 6
 # Unicode 15.1.0 DerivedCoreProperties.txt: Default_Ignorable_Code_Point.
 _DEFAULT_IGNORABLE_RANGES = (
@@ -162,6 +165,18 @@ _DEFAULT_IGNORABLE_RANGES = (
     (0x1D173, 0x1D17A),
     (0xE0000, 0xE0FFF),
 )
+_DEFAULT_IGNORABLE_PATTERN = re.compile(
+    "["
+    + "".join(
+        re.escape(chr(start)) if start == end else f"{re.escape(chr(start))}-{re.escape(chr(end))}"
+        for start, end in _DEFAULT_IGNORABLE_RANGES
+    )
+    + "]"
+)
+_ASCII_CONFUSABLE_PATTERN = re.compile(
+    "[" + "".join(re.escape(chr(codepoint)) for codepoint in ASCII_CONFUSABLE_SKELETON) + "]"
+)
+_REMOVE_ALLOWED_FORMAT_CHARACTERS = str.maketrans("", "", "".join(_ALLOWED_FORMAT_CHARS))
 
 
 def _suffix(path: str) -> str:
@@ -286,7 +301,11 @@ def _letter_spacing_run_spans(
     """Yield maximal runs of six or more separator-delimited single letters."""
     if check_runtime is not None:
         check_runtime()
-    if text.isascii() and _LETTER_SPACING_CANDIDATE.search(text) is None:
+    # Keep large benign Unicode artifacts on the C-level fast path. The
+    # candidate is deliberately broader than the exact scanner below, but it
+    # covers Unicode letters and every supported separator without a Python
+    # character-by-character pass when no six-letter run can exist.
+    if _LETTER_SPACING_CANDIDATE.search(text) is None:
         if check_runtime is not None:
             check_runtime()
         return
@@ -453,6 +472,24 @@ def compact_letter_view(text: str) -> SecurityTextView:
     return SecurityTextView("compact", output.getvalue(), offsets)
 
 
+def _requires_normalized_security_view(text: str) -> bool:
+    """Return whether normalization can produce a distinct security view."""
+    if _IGNORED_ASCII_CONTROL.search(text) is not None:
+        return True
+    if _DEFAULT_IGNORABLE_PATTERN.search(text) is not None:
+        return True
+    if not unicodedata.is_normalized("NFKC", text):
+        return True
+    if _ASCII_CONFUSABLE_PATTERN.search(text) is not None:
+        return True
+    if text.isprintable():
+        return False
+    # Newline, carriage return, and tab are retained unchanged by the
+    # projection. Any other non-printable character still needs the exact
+    # category-aware path in ``normalized_security_view``.
+    return not text.translate(_REMOVE_ALLOWED_FORMAT_CHARACTERS).isprintable()
+
+
 def security_text_views(text: str) -> tuple[SecurityTextView, ...]:
     """Return distinct raw, normalized, and compact views deterministically."""
     raw = SecurityTextView("raw", text)
@@ -461,7 +498,9 @@ def security_text_views(text: str) -> tuple[SecurityTextView, ...]:
         return (raw,)
     unique = [raw]
     seen = {text}
-    builders = [normalized_security_view]
+    builders: list[Callable[[str], SecurityTextView]] = []
+    if _requires_normalized_security_view(text):
+        builders.append(normalized_security_view)
     if (
         "\ufffd" in text
         or _next_offset(iter(_compact_gap_offsets(text))) is not None

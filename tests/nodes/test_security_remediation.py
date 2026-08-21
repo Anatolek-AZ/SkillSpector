@@ -13,6 +13,7 @@ from pathlib import Path
 
 import pytest
 
+import skillspector.artifacts as artifacts_module
 import skillspector.nodes.build_context as build_context_module
 from skillspector.artifacts import (
     ArtifactDisposition,
@@ -1249,6 +1250,19 @@ def test_unicode_anomaly_density_uses_context_for_non_format_ignorables() -> Non
     assert unicode_anomaly_density("☀️") == 0.0
     assert unicode_anomaly_density("ig\ufe0fnore") == pytest.approx(1 / 7)
     assert unicode_anomaly_density("Cafe\u0301") == 0.0
+
+
+def test_stable_printable_unicode_skips_unnecessary_normalized_projection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def unexpected_projection(_text: str) -> None:
+        raise AssertionError("stable Unicode text should remain on the raw fast path")
+
+    monkeypatch.setattr(artifacts_module, "normalized_security_view", unexpected_projection)
+
+    views = artifacts_module.security_text_views("😀" * 10_000)
+
+    assert [view.name for view in views] == ["raw"]
 
 
 def test_letter_spacing_compaction_never_collapses_ascii_word_separators() -> None:
