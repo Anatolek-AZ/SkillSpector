@@ -14,7 +14,7 @@ from __future__ import annotations
 import re
 import unicodedata
 from array import array
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from enum import StrEnum
 from io import StringIO
@@ -140,6 +140,8 @@ _TEXT_EXTENSIONS = frozenset(
 
 _ALLOWED_FORMAT_CHARS = frozenset({"\n", "\r", "\t"})
 _IGNORED_ASCII_CONTROL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+_LETTER_SPACING_CANDIDATE = re.compile(r"(?:[A-Za-z][^A-Za-z0-9\r\n]+){5}[A-Za-z]")
+_MIN_LETTER_SPACING_RUN_LETTERS = 6
 # Unicode 15.1.0 DerivedCoreProperties.txt: Default_Ignorable_Code_Point.
 _DEFAULT_IGNORABLE_RANGES = (
     (0x00AD, 0x00AD),
@@ -248,6 +250,105 @@ def _is_non_ascii_separator(ch: str) -> bool:
     return not ch.isascii() and unicodedata.category(ch).startswith("Z")
 
 
+def _is_letter_spacing_separator(ch: str) -> bool:
+    """Return whether *ch* can separate single-letter obfuscation tokens."""
+    if ch in {"\n", "\r", "\u2028", "\u2029"} or ch.isalnum():
+        return False
+    category = unicodedata.category(ch)
+    return (
+        ch.isspace()
+        or category.startswith(("P", "S", "Z"))
+        or _is_unconditionally_ignored(ch)
+        or is_default_ignorable(ch)
+        or ch == "\ufffd"
+    )
+
+
+def _letter_spacing_gap_signature(gap: str) -> tuple[str, str] | None:
+    """Return a stable signature for one unambiguous inter-letter gap."""
+    if not gap:
+        return None
+    if all(ch.isspace() for ch in gap):
+        return ("spacing", gap) if len(set(gap)) == 1 else None
+
+    marker = "".join(ch for ch in gap if not ch.isspace())
+    if not marker or len(set(marker)) != 1:
+        return None
+    return ("marked", marker[0])
+
+
+def _letter_spacing_run_spans(
+    text: str,
+    check_runtime: Callable[[], None] | None = None,
+    *,
+    require_consistent_separator_class: bool = True,
+) -> Iterator[tuple[int, int]]:
+    """Yield maximal runs of six or more separator-delimited single letters."""
+    if check_runtime is not None:
+        check_runtime()
+    if text.isascii() and _LETTER_SPACING_CANDIDATE.search(text) is None:
+        if check_runtime is not None:
+            check_runtime()
+        return
+    offset = 0
+    while offset < len(text):
+        if check_runtime is not None and offset % 4096 == 0:
+            check_runtime()
+        if not text[offset].isalpha() or (offset > 0 and text[offset - 1].isalpha()):
+            offset += 1
+            continue
+
+        run_start = offset
+        last_letter_end = offset + 1
+        run_signature: tuple[str, str] | None = None
+        letter_count = 1
+        cursor = last_letter_end
+
+        while cursor < len(text):
+            gap_start = cursor
+            while cursor < len(text) and _is_letter_spacing_separator(text[cursor]):
+                if check_runtime is not None and cursor % 4096 == 0:
+                    check_runtime()
+                cursor += 1
+            if gap_start == cursor or cursor >= len(text) or not text[cursor].isalpha():
+                break
+
+            next_letter_end = cursor + 1
+            if next_letter_end < len(text) and text[next_letter_end].isalpha():
+                break
+
+            gap_signature = _letter_spacing_gap_signature(text[gap_start:cursor])
+            if gap_signature is None:
+                break
+            if run_signature is None:
+                run_signature = gap_signature
+            elif require_consistent_separator_class and gap_signature != run_signature:
+                break
+
+            letter_count += 1
+            last_letter_end = next_letter_end
+            cursor = next_letter_end
+
+        if letter_count >= _MIN_LETTER_SPACING_RUN_LETTERS:
+            yield run_start, last_letter_end
+            offset = last_letter_end
+        else:
+            offset = run_start + 1
+
+
+def _has_letter_spacing_run(text: str) -> bool:
+    """Use a C-level ASCII prefilter before the exact Unicode-aware scan."""
+    return next(_letter_spacing_run_spans(text), None) is not None
+
+
+def _letter_spacing_gap_offsets(text: str) -> Iterator[int]:
+    """Yield only the separator offsets inside confirmed letter-spacing runs."""
+    for start, end in _letter_spacing_run_spans(text):
+        for offset in range(start, end):
+            if _is_letter_spacing_separator(text[offset]):
+                yield offset
+
+
 def _is_token_gap_character(ch: str) -> bool:
     return (
         _is_unconditionally_ignored(ch)
@@ -323,16 +424,27 @@ def compact_letter_view(text: str) -> SecurityTextView:
     offsets = array("I")
     contextual_offsets = iter(_contextual_default_ignorable_offsets(text))
     compact_offsets = iter(_compact_gap_offsets(text))
+    letter_spacing_offsets = iter(_letter_spacing_gap_offsets(text))
     next_contextual = _next_offset(contextual_offsets)
     next_compact = _next_offset(compact_offsets)
+    next_letter_spacing = _next_offset(letter_spacing_offsets)
     for source_offset, ch in enumerate(text):
         is_contextual = source_offset == next_contextual
         is_compact = source_offset == next_compact
+        is_letter_spacing = source_offset == next_letter_spacing
         if is_contextual:
             next_contextual = _next_offset(contextual_offsets)
         if is_compact:
             next_compact = _next_offset(compact_offsets)
-        if _is_unconditionally_ignored(ch) or ch == "\ufffd" or is_contextual or is_compact:
+        if is_letter_spacing:
+            next_letter_spacing = _next_offset(letter_spacing_offsets)
+        if (
+            _is_unconditionally_ignored(ch)
+            or ch == "\ufffd"
+            or is_contextual
+            or is_compact
+            or is_letter_spacing
+        ):
             continue
         normalized = unicodedata.normalize("NFKC", ch).translate(ASCII_CONFUSABLE_SKELETON)
         for normalized_char in normalized:
@@ -344,12 +456,17 @@ def compact_letter_view(text: str) -> SecurityTextView:
 def security_text_views(text: str) -> tuple[SecurityTextView, ...]:
     """Return distinct raw, normalized, and compact views deterministically."""
     raw = SecurityTextView("raw", text)
-    if text.isascii() and _IGNORED_ASCII_CONTROL.search(text) is None:
+    has_letter_spacing = _has_letter_spacing_run(text)
+    if text.isascii() and _IGNORED_ASCII_CONTROL.search(text) is None and not has_letter_spacing:
         return (raw,)
     unique = [raw]
     seen = {text}
     builders = [normalized_security_view]
-    if "\ufffd" in text or _next_offset(iter(_compact_gap_offsets(text))) is not None:
+    if (
+        "\ufffd" in text
+        or _next_offset(iter(_compact_gap_offsets(text))) is not None
+        or has_letter_spacing
+    ):
         builders.append(compact_letter_view)
     for build_view in builders:
         view = build_view(text)
