@@ -14,6 +14,7 @@ from skillspector.inspection_ledger import (
     InspectionLedgerEvent,
     LedgerOutcome,
     LedgerReason,
+    LedgerRecordType,
     analyzer_status_for_events,
     ledger_event,
 )
@@ -305,6 +306,7 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
         artifact: dict[str, object] = raw_artifact if isinstance(raw_artifact, dict) else {}
         finding_start = len(budget.findings)
         resource_limit: _ArtifactIntegrityResourceLimitError | None = None
+        first_spacing_line: int | None = None
         try:
             budget.check_runtime()
             if artifact.get("misleading_extension"):
@@ -385,8 +387,21 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
                 emitted_finding_ids=emitted_ids,
             )
         events.append(event)
+        if resource_limit is None and first_spacing_line is not None:
+            events.append(
+                ledger_event(
+                    outcome=LedgerOutcome.PARTIAL,
+                    phase="artifact_interpretation",
+                    path=path,
+                    start_line=first_spacing_line,
+                    end_line=first_spacing_line,
+                    record_type=LedgerRecordType.SYSTEM,
+                    reason=LedgerReason.OBFUSCATED_INSTRUCTION_TEXT,
+                )
+            )
+    work_events = (event for event in events if event["record_type"] == LedgerRecordType.WORK_ITEM)
     return {
         "findings": budget.findings,
         "inspection_ledger": events,
-        "analyzer_status_events": [analyzer_status_for_events(ANALYZER_ID, events)],
+        "analyzer_status_events": [analyzer_status_for_events(ANALYZER_ID, work_events)],
     }

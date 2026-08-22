@@ -26,7 +26,7 @@ from skillspector.artifacts import (
 )
 from skillspector.constants import MAX_ANALYZABLE_FILE_BYTES
 from skillspector.graph import graph
-from skillspector.inspection_ledger import LedgerReason
+from skillspector.inspection_ledger import LedgerOutcome, LedgerReason, LedgerRecordType
 from skillspector.models import AnalyzerFinding, Finding, Location, Severity
 from skillspector.nodes.analyzers import static_patterns_prompt_injection, static_runner
 from skillspector.nodes.analyzers.artifact_integrity import node as artifact_integrity
@@ -1351,6 +1351,25 @@ def test_artifact_integrity_flags_long_inter_character_separator_run(content: st
     assert len(ae6) == 1
     assert ae6[0].severity == "HIGH"
     assert ae6[0].start_line == 1
+    work_events = [
+        event
+        for event in response["inspection_ledger"]
+        if event["record_type"] == LedgerRecordType.WORK_ITEM
+    ]
+    assert len(work_events) == 1
+    assert work_events[0]["outcome"] == LedgerOutcome.COMPLETED
+    interpretation_events = [
+        event
+        for event in response["inspection_ledger"]
+        if event["record_type"] == LedgerRecordType.SYSTEM
+        and event.get("reason_code") == LedgerReason.OBFUSCATED_INSTRUCTION_TEXT
+    ]
+    assert len(interpretation_events) == 1
+    assert interpretation_events[0]["outcome"] == LedgerOutcome.PARTIAL
+    assert interpretation_events[0]["path"] == "SKILL.md"
+    analyzer_status = response["analyzer_status_events"][0]
+    assert analyzer_status["status"] == "completed"
+    assert len(analyzer_status["planned_work"]) == 1
 
 
 def test_artifact_integrity_ignores_benign_short_single_letter_notation() -> None:
@@ -1419,6 +1438,12 @@ def test_inter_character_separator_variants_retain_static_prompt_injection_findi
     assert all(finding.start_line == 2 for finding in p1)
     assert any(finding.rule_id == "AE6" for finding in result["filtered_findings"])
     assert result["risk_recommendation"] != "SAFE"
+    completeness = result["analysis_completeness"]
+    assert completeness["is_complete"] is False
+    assert any(
+        row["reason_code"] == LedgerReason.OBFUSCATED_INSTRUCTION_TEXT
+        for row in completeness["ledger_exceptions"]
+    )
 
 
 def test_fully_space_separated_instruction_is_scored_end_to_end(tmp_path: Path) -> None:
@@ -1432,6 +1457,17 @@ def test_fully_space_separated_instruction_is_scored_end_to_end(tmp_path: Path) 
     assert ae6[0].severity == "HIGH"
     assert ae6[0].start_line == 2
     assert result["risk_recommendation"] == "CAUTION"
+    completeness = result["analysis_completeness"]
+    assert completeness["status"] == "partial"
+    assert completeness["is_complete"] is False
+    assert completeness["execution_successful"] is True
+    assert completeness["coverage_percent"] == 100.0
+    assert completeness["fully_inspected_files"] == 1
+    assert completeness["partially_inspected_files"] == 0
+    assert any(
+        row["reason_code"] == LedgerReason.OBFUSCATED_INSTRUCTION_TEXT
+        for row in completeness["ledger_exceptions"]
+    )
 
 
 def test_benign_punctuation_layout_and_code_controls_stay_safe(tmp_path: Path) -> None:
@@ -1444,6 +1480,9 @@ description: Benign writing and formatting examples
 Use state-of-the-art read-write tools in the U.S.A.
 Visit https://example.invalid/docs or email docs@example.invalid. ☀️
 Musical notes may ascend as A B C D E F G.
+Vowels may be written as A E I O U.
+The spelling exercise r e c e i v e demonstrates letter order.
+Initialisms such as N A S A and P E D 8 are ordinary notation.
 Use the initialism N.V.I.D.I.A. in this example.
 The synthetic URL is https://a.b.c.d.e.f.example.invalid/path.
 The synthetic address is a.b.c.d.e.f@example.invalid.
@@ -1468,6 +1507,7 @@ Coordinates use x y z in ordinary notation.
 
     assert not any(finding.rule_id == "AE6" for finding in result["filtered_findings"])
     assert result["risk_recommendation"] == "SAFE"
+    assert result["analysis_completeness"]["is_complete"] is True
 
 
 @pytest.mark.parametrize(
