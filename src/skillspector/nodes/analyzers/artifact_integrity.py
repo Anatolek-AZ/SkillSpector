@@ -9,7 +9,7 @@ import time
 import unicodedata
 from dataclasses import dataclass, field
 
-from skillspector.artifacts import _letter_spacing_run_spans
+from skillspector.artifacts import _concealed_instruction_run_spans
 from skillspector.inspection_ledger import (
     InspectionLedgerEvent,
     LedgerOutcome,
@@ -166,10 +166,9 @@ def _text_signals(
     spacing_span = next(
         (
             span
-            for span in _letter_spacing_run_spans(
+            for span in _concealed_instruction_run_spans(
                 content,
                 budget.check_runtime,
-                require_consistent_separator_class=False,
             )
             if _spacing_span_has_security_term(content, span, budget)
         ),

@@ -144,6 +144,10 @@ _LETTER_SPACING_CANDIDATE = re.compile(
     r"(?:[^\W\d_](?:[^\w\r\n]|_)+){5}[^\W\d_]",
     re.UNICODE,
 )
+_CONCEALED_INSTRUCTION_CANDIDATE = re.compile(
+    r"(?:[^\W\d_](?:[^\w]|_)+){5}[^\W\d_]",
+    re.UNICODE,
+)
 _MIN_LETTER_SPACING_RUN_LETTERS = 6
 # Unicode 15.1.0 DerivedCoreProperties.txt: Default_Ignorable_Code_Point.
 _DEFAULT_IGNORABLE_RANGES = (
@@ -355,6 +359,52 @@ def _letter_spacing_run_spans(
             offset = run_start + 1
 
 
+def _concealed_instruction_run_spans(
+    text: str,
+    check_runtime: Callable[[], None] | None = None,
+) -> Iterator[tuple[int, int]]:
+    """Yield broad, bounded single-letter runs for security-term evidence only."""
+    if check_runtime is not None:
+        check_runtime()
+    if _CONCEALED_INSTRUCTION_CANDIDATE.search(text) is None:
+        if check_runtime is not None:
+            check_runtime()
+        return
+
+    offset = 0
+    while offset < len(text):
+        if check_runtime is not None and offset % 4096 == 0:
+            check_runtime()
+        if not text[offset].isalpha() or (offset > 0 and text[offset - 1].isalpha()):
+            offset += 1
+            continue
+
+        run_start = offset
+        last_letter_end = offset + 1
+        letter_count = 1
+        cursor = last_letter_end
+        while cursor < len(text):
+            gap_start = cursor
+            while cursor < len(text) and not text[cursor].isalnum():
+                if check_runtime is not None and cursor % 4096 == 0:
+                    check_runtime()
+                cursor += 1
+            if gap_start == cursor or cursor >= len(text) or not text[cursor].isalpha():
+                break
+
+            letter_count += 1
+            last_letter_end = cursor + 1
+            cursor = last_letter_end
+            if cursor < len(text) and text[cursor].isalpha():
+                break
+
+        if letter_count >= _MIN_LETTER_SPACING_RUN_LETTERS:
+            yield run_start, last_letter_end
+            offset = last_letter_end
+        else:
+            offset = run_start + 1
+
+
 def _has_letter_spacing_run(text: str) -> bool:
     """Use a C-level ASCII prefilter before the exact Unicode-aware scan."""
     return next(_letter_spacing_run_spans(text), None) is not None
@@ -379,8 +429,10 @@ def _is_token_gap_character(ch: str) -> bool:
 
 def _token_bridging_gap_spans(
     text: str,
+    *,
+    require_word_boundaries: bool = True,
 ) -> Iterator[tuple[int, int]]:
-    """Yield word-bounded noise runs in one pass without crossing ASCII spaces."""
+    """Yield contextual noise runs in one pass without crossing ASCII spaces."""
     offset = 0
     while offset < len(text):
         if not _is_token_gap_character(text[offset]):
@@ -389,21 +441,32 @@ def _token_bridging_gap_spans(
         start = offset
         while offset < len(text) and _is_token_gap_character(text[offset]):
             offset += 1
-        if (
-            start > 0
-            and offset < len(text)
-            and _is_word_character(text[start - 1])
-            and _is_word_character(text[offset])
-        ):
+        before_is_word = start > 0 and _is_word_character(text[start - 1])
+        after_is_word = offset < len(text) and _is_word_character(text[offset])
+        is_contextual = (
+            before_is_word and after_is_word
+            if require_word_boundaries
+            else before_is_word or after_is_word
+        )
+        if is_contextual:
             yield start, offset
 
 
 def _contextual_default_ignorable_offsets(text: str) -> Iterator[int]:
-    """Yield non-format default-ignorables only when they bridge word tokens."""
-    for start, end in _token_bridging_gap_spans(text):
+    """Yield non-format default-ignorables next to text without altering emoji forms."""
+    for start, end in _token_bridging_gap_spans(text, require_word_boundaries=False):
         for offset in range(start, end):
             ch = text[offset]
             if is_default_ignorable(ch) and not _is_unconditionally_ignored(ch):
+                previous = text[offset - 1] if offset else ""
+                following = text[offset + 1] if offset + 1 < len(text) else ""
+                if 0xFE00 <= ord(ch) <= 0xFE0F and (
+                    previous
+                    and unicodedata.category(previous) == "So"
+                    or following
+                    and unicodedata.category(following) == "Me"
+                ):
+                    continue
                 yield offset
 
 
