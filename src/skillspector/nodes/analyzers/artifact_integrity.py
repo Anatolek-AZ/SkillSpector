@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import re
 import time
 import unicodedata
 from collections import deque
@@ -30,6 +31,7 @@ from skillspector.state import (
     SkillspectorState,
     transitive_remaining_seconds,
 )
+from skillspector.unicode_confusables import ASCII_CONFUSABLE_SKELETON
 
 from .static_runner import MAX_FINDINGS_PER_ANALYZER, MAX_FINDINGS_PER_ARTIFACT
 
@@ -57,7 +59,270 @@ _LETTER_SPACING_SECURITY_TERMS = (
     "unrestricted",
     "userdata",
 )
+_LETTER_SPACING_EXACT_SECURITY_TERMS = frozenset(
+    {
+        "accesstoken",
+        "apikey",
+        "credential",
+        "credentials",
+        "password",
+        "privatekey",
+        "secrettoken",
+        "systemprompt",
+    }
+)
+_LETTER_SPACING_PROMPT_ACTIONS = (
+    "disclose",
+    "disclosed",
+    "discloses",
+    "disclosing",
+    "display",
+    "displayed",
+    "displaying",
+    "displays",
+    "dump",
+    "dumped",
+    "dumping",
+    "dumps",
+    "echo",
+    "echoed",
+    "echoes",
+    "echoing",
+    "expose",
+    "exposed",
+    "exposes",
+    "exposing",
+    "output",
+    "outputs",
+    "outputted",
+    "outputting",
+    "print",
+    "printed",
+    "printing",
+    "prints",
+    "return",
+    "returned",
+    "returning",
+    "returns",
+    "reveal",
+    "revealed",
+    "revealing",
+    "reveals",
+    "show",
+    "showed",
+    "showing",
+    "shown",
+    "shows",
+)
+_LETTER_SPACING_HIGH_RISK_EXFILTRATION_ACTIONS = (
+    "exfiltrate",
+    "exfiltrated",
+    "exfiltrates",
+    "exfiltrating",
+    "leak",
+    "leaked",
+    "leaking",
+    "leaks",
+    "steal",
+    "stealing",
+    "steals",
+    "stole",
+    "stolen",
+)
+_LETTER_SPACING_TRANSFER_ACTIONS = (
+    "forward",
+    "forwarded",
+    "forwarding",
+    "forwards",
+    "post",
+    "posted",
+    "posting",
+    "posts",
+    "send",
+    "sending",
+    "sends",
+    "sent",
+    "transmit",
+    "transmits",
+    "transmitted",
+    "transmitting",
+    "upload",
+    "uploaded",
+    "uploading",
+    "uploads",
+)
+_LETTER_SPACING_DESTRUCTIVE_ACTIONS = (
+    "delete",
+    "deleted",
+    "deletes",
+    "deleting",
+    "destroy",
+    "destroyed",
+    "destroying",
+    "destroys",
+    "erase",
+    "erased",
+    "erases",
+    "erasing",
+    "remove",
+    "removed",
+    "removes",
+    "removing",
+    "wipe",
+    "wiped",
+    "wipes",
+    "wiping",
+)
+_LETTER_SPACING_SECURITY_PREFIXES = (
+    "covertly",
+    "immediately",
+    "now",
+    "please",
+    "quietly",
+    "secretly",
+    "silently",
+)
+_LETTER_SPACING_SECURITY_CONNECTORS = (
+    "a",
+    "all",
+    "any",
+    "available",
+    "full",
+    "local",
+    "private",
+    "remote",
+    "secret",
+    "sensitive",
+    "stored",
+    "system",
+    "the",
+    "user",
+    "users",
+    "your",
+)
+_LETTER_SPACING_PROMPT_TARGETS = (
+    "instructions",
+    "prompt",
+    "prompts",
+    "rules",
+    "systeminstructions",
+    "systemprompt",
+    "systemprompts",
+)
+_LETTER_SPACING_SENSITIVE_TARGETS = (
+    "accesstoken",
+    "accesstokens",
+    "apikey",
+    "apikeys",
+    "credential",
+    "credentials",
+    "password",
+    "passwords",
+    "privatekey",
+    "privatekeys",
+    "secret",
+    "secrets",
+    "secrettoken",
+    "secrettokens",
+    "sshkey",
+    "sshkeys",
+    "systeminstructions",
+    "systemprompt",
+    "systemprompts",
+    "token",
+    "tokens",
+    "userdata",
+)
+_LETTER_SPACING_HIGH_RISK_EXFILTRATION_TARGETS = (
+    *_LETTER_SPACING_SENSITIVE_TARGETS,
+    "data",
+    "file",
+    "files",
+)
+_LETTER_SPACING_DESTRUCTIVE_TARGETS = (
+    "credential",
+    "credentials",
+    "data",
+    "directories",
+    "directory",
+    "file",
+    "files",
+    "history",
+    "memory",
+    "password",
+    "passwords",
+    "secret",
+    "secrets",
+    "token",
+    "tokens",
+    "userdata",
+    "workspace",
+)
+_LETTER_SPACING_SECURITY_SUFFIXES = (
+    "immediately",
+    "now",
+)
+_MAX_LETTER_SPACING_SECURITY_CONNECTORS = 3
+
+
+def _compile_letter_spacing_command_pattern(
+    actions: tuple[str, ...],
+    targets: tuple[str, ...],
+) -> re.Pattern[str]:
+    """Compile one finite command family over a condensed letter run."""
+
+    def alternation(values: tuple[str, ...]) -> str:
+        return "|".join(re.escape(value) for value in sorted(values, key=len, reverse=True))
+
+    return re.compile(
+        rf"(?:(?:{alternation(_LETTER_SPACING_SECURITY_PREFIXES)}))?"
+        rf"(?:{alternation(actions)})"
+        rf"(?:(?:{alternation(_LETTER_SPACING_SECURITY_CONNECTORS)}))"
+        rf"{{0,{_MAX_LETTER_SPACING_SECURITY_CONNECTORS}}}"
+        rf"(?:{alternation(targets)})"
+        rf"(?:(?:{alternation(_LETTER_SPACING_SECURITY_SUFFIXES)}))?"
+    )
+
+
+_LETTER_SPACING_COMMAND_PATTERNS = (
+    _compile_letter_spacing_command_pattern(
+        _LETTER_SPACING_PROMPT_ACTIONS,
+        _LETTER_SPACING_PROMPT_TARGETS,
+    ),
+    _compile_letter_spacing_command_pattern(
+        _LETTER_SPACING_HIGH_RISK_EXFILTRATION_ACTIONS,
+        _LETTER_SPACING_HIGH_RISK_EXFILTRATION_TARGETS,
+    ),
+    _compile_letter_spacing_command_pattern(
+        _LETTER_SPACING_TRANSFER_ACTIONS,
+        _LETTER_SPACING_SENSITIVE_TARGETS,
+    ),
+    _compile_letter_spacing_command_pattern(
+        _LETTER_SPACING_DESTRUCTIVE_ACTIONS,
+        _LETTER_SPACING_DESTRUCTIVE_TARGETS,
+    ),
+)
 _MAX_LETTER_SPACING_SECURITY_TERM = max(map(len, _LETTER_SPACING_SECURITY_TERMS))
+_LETTER_SPACING_ALL_ACTIONS = (
+    _LETTER_SPACING_PROMPT_ACTIONS
+    + _LETTER_SPACING_HIGH_RISK_EXFILTRATION_ACTIONS
+    + _LETTER_SPACING_TRANSFER_ACTIONS
+    + _LETTER_SPACING_DESTRUCTIVE_ACTIONS
+)
+_LETTER_SPACING_ALL_TARGETS = (
+    _LETTER_SPACING_PROMPT_TARGETS
+    + _LETTER_SPACING_HIGH_RISK_EXFILTRATION_TARGETS
+    + _LETTER_SPACING_SENSITIVE_TARGETS
+    + _LETTER_SPACING_DESTRUCTIVE_TARGETS
+)
+_MAX_LETTER_SPACING_SECURITY_PHRASE = max(
+    max(map(len, _LETTER_SPACING_EXACT_SECURITY_TERMS)),
+    max(map(len, _LETTER_SPACING_SECURITY_PREFIXES))
+    + max(map(len, _LETTER_SPACING_ALL_ACTIONS))
+    + _MAX_LETTER_SPACING_SECURITY_CONNECTORS * max(map(len, _LETTER_SPACING_SECURITY_CONNECTORS))
+    + max(map(len, _LETTER_SPACING_ALL_TARGETS))
+    + max(map(len, _LETTER_SPACING_SECURITY_SUFFIXES)),
+)
 
 
 class _ArtifactIntegrityResourceLimitError(RuntimeError):
@@ -123,24 +388,46 @@ class _ArtifactIntegrityBudget:
         return len(self.findings) >= MAX_FINDINGS_PER_ANALYZER
 
 
-def _spacing_span_has_security_term(
+def _spacing_phrase_has_security_signal(phrase: str) -> bool:
+    """Match a complete sensitive concept or bounded command grammar."""
+    return phrase in _LETTER_SPACING_EXACT_SECURITY_TERMS or any(
+        pattern.fullmatch(phrase) is not None for pattern in _LETTER_SPACING_COMMAND_PATTERNS
+    )
+
+
+def _spacing_span_has_security_signal(
     content: str,
     span: tuple[int, int],
     budget: _ArtifactIntegrityBudget,
 ) -> bool:
-    """Match security-relevant condensed terms without retaining the full run."""
+    """Match bounded security semantics without retaining the full run."""
     overlap = ""
     letters: list[str] = []
     letter_characters = 0
+    phrase_parts: list[str] = []
+    phrase_characters = 0
+    phrase_overflow = False
     for offset in range(*span):
         if offset % _RUNTIME_CHECK_INTERVAL_CHARS == 0:
             budget.check_runtime()
         character = content[offset]
         if not character.isalpha():
             continue
-        folded = character.casefold()
+        folded = (
+            unicodedata.normalize("NFKC", character).translate(ASCII_CONFUSABLE_SKELETON).casefold()
+        )
+        folded = "".join(normalized for normalized in folded if normalized.isalpha())
+        if not folded:
+            continue
         letters.append(folded)
         letter_characters += len(folded)
+        if not phrase_overflow:
+            phrase_characters += len(folded)
+            if phrase_characters <= _MAX_LETTER_SPACING_SECURITY_PHRASE:
+                phrase_parts.append(folded)
+            else:
+                phrase_parts.clear()
+                phrase_overflow = True
         if letter_characters < _RUNTIME_CHECK_INTERVAL_CHARS:
             continue
         block = overlap + "".join(letters)
@@ -151,7 +438,18 @@ def _spacing_span_has_security_term(
         letter_characters = 0
 
     block = overlap + "".join(letters)
-    return any(term in block for term in _LETTER_SPACING_SECURITY_TERMS)
+    if any(term in block for term in _LETTER_SPACING_SECURITY_TERMS):
+        return True
+    if phrase_overflow:
+        return False
+    if _spacing_phrase_has_security_signal("".join(phrase_parts)):
+        return True
+    return (
+        bool(phrase_parts)
+        and span[1] < len(content)
+        and content[span[1]].isalpha()
+        and _spacing_phrase_has_security_signal("".join(phrase_parts[:-1]))
+    )
 
 
 def _matching_security_term_raw_spans(
@@ -228,7 +526,7 @@ def _text_signals(
                 content,
                 budget.check_runtime,
             )
-            if _spacing_span_has_security_term(content, span, budget)
+            if _spacing_span_has_security_signal(content, span, budget)
         ),
         None,
     )

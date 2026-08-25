@@ -658,6 +658,11 @@ async def test_letter_spacing_benign_controls_remain_install_safe(tmp_path: Path
 Musical notes may ascend as A B C D E F G.
 Vowels may be written as A E I O U.
 The spelling exercise r e c e i v e demonstrates letter order.
+The spelling exercise c o n f i g u r a t i o n demonstrates letter order.
+Alphabet positions may be shown as A B C D E F G H I J K.
+UI lettering may show u p l o a d a v a i l a b l e f i l e s.
+UI lettering may show t r a n s m i t l o c a l f i l e s.
+UI lettering may show r e v e a l a f i l e.
 Initialisms such as U.S.A., N A S A, and P E D 8 are ordinary notation.
 Visit https://example.invalid/docs and use state-of-the-art formatting. 🌤️
 
