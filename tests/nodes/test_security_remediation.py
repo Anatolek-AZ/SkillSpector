@@ -86,6 +86,17 @@ def test_normalized_view_removes_default_ignorable_at_word_boundary_with_raw_off
     assert view.source_offset(7) == source.index("previous")
 
 
+def test_contextual_boundary_scan_prefilters_text_without_default_ignorables(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail_python_scan(*args: object, **kwargs: object) -> None:
+        raise AssertionError("default-ignorable-free text must not enter the Python gap scanner")
+
+    monkeypatch.setattr(artifacts_module, "_token_bridging_gap_spans", fail_python_scan)
+
+    assert not list(artifacts_module._contextual_default_ignorable_boundary_spans("a" * 1_000_000))
+
+
 @pytest.mark.parametrize(
     "variant",
     [

@@ -502,6 +502,11 @@ def _contextual_default_ignorable_boundary_spans(
     A token-boundary gap has a word character on exactly one side. This keeps
     whole-token concealment evidence separate from in-token normalization.
     """
+    if _DEFAULT_IGNORABLE_PATTERN.search(text) is None:
+        if check_runtime is not None:
+            check_runtime()
+        return
+
     for start, end in _token_bridging_gap_spans(
         text,
         require_word_boundaries=False,
