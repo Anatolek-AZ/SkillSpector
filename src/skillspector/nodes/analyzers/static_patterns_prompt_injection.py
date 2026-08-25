@@ -21,6 +21,7 @@ import fnmatch
 import re
 import sys
 
+from skillspector.artifacts import _is_emoji_base
 from skillspector.logging_config import get_logger
 from skillspector.models import AnalyzerFinding, Location, Severity
 from skillspector.state import AnalyzerNodeResponse, SkillspectorState
@@ -171,15 +172,6 @@ _EMOJI_TAG_SEQUENCE = re.compile(
 
 _EMOJI_MODIFIERS = range(0x1F3FB, 0x1F400)
 _VARIATION_SELECTORS = {0xFE0E, 0xFE0F}
-
-
-def _is_emoji_base(ch: str) -> bool:
-    codepoint = ord(ch)
-    return (
-        0x1F000 <= codepoint <= 0x1FAFF
-        or 0x2600 <= codepoint <= 0x27BF
-        or codepoint in (0x00A9, 0x00AE, 0x203C, 0x2049, 0x2122, 0x2139, 0x3030, 0x303D)
-    )
 
 
 def _previous_emoji_base(content: str, offset: int) -> bool:

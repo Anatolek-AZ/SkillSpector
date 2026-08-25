@@ -7,9 +7,14 @@ from __future__ import annotations
 
 import time
 import unicodedata
+from collections import deque
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 
-from skillspector.artifacts import _concealed_instruction_run_spans
+from skillspector.artifacts import (
+    _concealed_instruction_run_spans,
+    _contextual_default_ignorable_boundary_spans,
+)
 from skillspector.inspection_ledger import (
     InspectionLedgerEvent,
     LedgerOutcome,
@@ -149,6 +154,59 @@ def _spacing_span_has_security_term(
     return any(term in block for term in _LETTER_SPACING_SECURITY_TERMS)
 
 
+def _matching_security_term_raw_spans(
+    projection: deque[str],
+    raw_offsets: deque[int],
+) -> Iterator[tuple[int, int]]:
+    """Yield raw envelopes for terms ending in a bounded projection."""
+    normalized = "".join(projection)
+    for term in _LETTER_SPACING_SECURITY_TERMS:
+        if normalized.endswith(term):
+            yield raw_offsets[-len(term)], raw_offsets[-1] + 1
+
+
+def _contextual_ignorable_security_line(
+    content: str,
+    budget: _ArtifactIntegrityBudget,
+) -> int | None:
+    """Return the first boundary gap that touches a security-term match."""
+    spans = iter(
+        _contextual_default_ignorable_boundary_spans(
+            content,
+            budget.check_runtime,
+        )
+    )
+    next_span = next(spans, None)
+    latest_span: tuple[int, int] | None = None
+    projection: deque[str] = deque(maxlen=_MAX_LETTER_SPACING_SECURITY_TERM)
+    raw_offsets: deque[int] = deque(maxlen=_MAX_LETTER_SPACING_SECURITY_TERM)
+
+    for offset, character in enumerate(content):
+        if offset % _RUNTIME_CHECK_INTERVAL_CHARS == 0:
+            budget.check_runtime()
+        if not character.isalpha():
+            continue
+        for folded in character.casefold():
+            if not folded.isalpha():
+                continue
+            projection.append(folded)
+            raw_offsets.append(offset)
+            term_end = offset + 1
+            while next_span is not None and next_span[0] <= term_end:
+                latest_span = next_span
+                next_span = next(spans, None)
+            if latest_span is None:
+                continue
+            for term_start, matched_term_end in _matching_security_term_raw_spans(
+                projection,
+                raw_offsets,
+            ):
+                if latest_span[0] <= matched_term_end and latest_span[1] >= term_start:
+                    budget.check_runtime()
+                    return content.count("\n", 0, latest_span[0]) + 1
+    return None
+
+
 def _text_signals(
     content: str,
     budget: _ArtifactIntegrityBudget,
@@ -177,6 +235,13 @@ def _text_signals(
     first_spacing_line = (
         content.count("\n", 0, spacing_span[0]) + 1 if spacing_span is not None else None
     )
+    first_contextual_ignorable_line = _contextual_ignorable_security_line(content, budget)
+    obfuscation_lines = [
+        value
+        for value in (first_spacing_line, first_contextual_ignorable_line)
+        if value is not None
+    ]
+    first_obfuscation_line = min(obfuscation_lines, default=None)
 
     for index, character in enumerate(content):
         if index % _RUNTIME_CHECK_INTERVAL_CHARS == 0:
@@ -210,7 +275,7 @@ def _text_signals(
     budget.check_runtime()
     mixed_script = mixed_script or ("latin" in token_scripts and len(token_scripts) > 1)
     density = ignored_characters / len(content) if content else 0.0
-    return density, mixed_script, first_nul_line, first_spacing_line
+    return density, mixed_script, first_nul_line, first_obfuscation_line
 
 
 def _partial_limit_event(
@@ -305,7 +370,7 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
         artifact: dict[str, object] = raw_artifact if isinstance(raw_artifact, dict) else {}
         finding_start = len(budget.findings)
         resource_limit: _ArtifactIntegrityResourceLimitError | None = None
-        first_spacing_line: int | None = None
+        first_obfuscation_line: int | None = None
         try:
             budget.check_runtime()
             if artifact.get("misleading_extension"):
@@ -334,8 +399,8 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
                             confidence=1.0,
                         )
                     )
-                format_density, mixed_script, first_nul_line, first_spacing_line = _text_signals(
-                    content, budget
+                format_density, mixed_script, first_nul_line, first_obfuscation_line = (
+                    _text_signals(content, budget)
                 )
                 if artifact.get("contains_nul") and first_nul_line is not None:
                     budget.emit(
@@ -358,7 +423,7 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
                             confidence=0.8,
                         )
                     )
-                if first_spacing_line is not None:
+                if first_obfuscation_line is not None:
                     budget.emit(
                         _finding(
                             "AE6",
@@ -366,7 +431,7 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
                             path,
                             severity="HIGH",
                             confidence=0.9,
-                            line=first_spacing_line,
+                            line=first_obfuscation_line,
                         )
                     )
         except _ArtifactIntegrityResourceLimitError as exc:
@@ -386,14 +451,14 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
                 emitted_finding_ids=emitted_ids,
             )
         events.append(event)
-        if resource_limit is None and first_spacing_line is not None:
+        if resource_limit is None and first_obfuscation_line is not None:
             events.append(
                 ledger_event(
                     outcome=LedgerOutcome.PARTIAL,
                     phase="artifact_interpretation",
                     path=path,
-                    start_line=first_spacing_line,
-                    end_line=first_spacing_line,
+                    start_line=first_obfuscation_line,
+                    end_line=first_obfuscation_line,
                     record_type=LedgerRecordType.SYSTEM,
                     reason=LedgerReason.OBFUSCATED_INSTRUCTION_TEXT,
                 )

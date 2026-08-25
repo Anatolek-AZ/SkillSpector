@@ -242,6 +242,16 @@ def decode_text(data: bytes) -> str:
     return data.decode("utf-8", errors="replace")
 
 
+def _is_emoji_base(ch: str) -> bool:
+    """Return whether one character is a base for emoji presentation forms."""
+    codepoint = ord(ch)
+    return (
+        0x1F000 <= codepoint <= 0x1FAFF
+        or 0x2600 <= codepoint <= 0x27BF
+        or codepoint in (0x00A9, 0x00AE, 0x203C, 0x2049, 0x2122, 0x2139, 0x3030, 0x303D)
+    )
+
+
 def is_default_ignorable(ch: str) -> bool:
     """Return the pinned Unicode Default_Ignorable_Code_Point property."""
     codepoint = ord(ch)
@@ -431,15 +441,20 @@ def _token_bridging_gap_spans(
     text: str,
     *,
     require_word_boundaries: bool = True,
+    check_runtime: Callable[[], None] | None = None,
 ) -> Iterator[tuple[int, int]]:
     """Yield contextual noise runs in one pass without crossing ASCII spaces."""
     offset = 0
     while offset < len(text):
+        if check_runtime is not None and offset % 4096 == 0:
+            check_runtime()
         if not _is_token_gap_character(text[offset]):
             offset += 1
             continue
         start = offset
         while offset < len(text) and _is_token_gap_character(text[offset]):
+            if check_runtime is not None and offset % 4096 == 0:
+                check_runtime()
             offset += 1
         before_is_word = start > 0 and _is_word_character(text[start - 1])
         after_is_word = offset < len(text) and _is_word_character(text[offset])
@@ -452,22 +467,56 @@ def _token_bridging_gap_spans(
             yield start, offset
 
 
+def _is_contextual_default_ignorable_offset(text: str, offset: int) -> bool:
+    """Return whether one offset is an ignorable outside an emoji presentation form."""
+    ch = text[offset]
+    if not is_default_ignorable(ch) or _is_unconditionally_ignored(ch):
+        return False
+    previous = text[offset - 1] if offset else ""
+    following = text[offset + 1] if offset + 1 < len(text) else ""
+    return not (
+        0xFE00 <= ord(ch) <= 0xFE0F
+        and (
+            previous
+            and _is_emoji_base(previous)
+            or following
+            and unicodedata.category(following) == "Me"
+        )
+    )
+
+
 def _contextual_default_ignorable_offsets(text: str) -> Iterator[int]:
     """Yield non-format default-ignorables next to text without altering emoji forms."""
     for start, end in _token_bridging_gap_spans(text, require_word_boundaries=False):
         for offset in range(start, end):
-            ch = text[offset]
-            if is_default_ignorable(ch) and not _is_unconditionally_ignored(ch):
-                previous = text[offset - 1] if offset else ""
-                following = text[offset + 1] if offset + 1 < len(text) else ""
-                if 0xFE00 <= ord(ch) <= 0xFE0F and (
-                    previous
-                    and unicodedata.category(previous) == "So"
-                    or following
-                    and unicodedata.category(following) == "Me"
-                ):
-                    continue
+            if _is_contextual_default_ignorable_offset(text, offset):
                 yield offset
+
+
+def _contextual_default_ignorable_boundary_spans(
+    text: str,
+    check_runtime: Callable[[], None] | None = None,
+) -> Iterator[tuple[int, int]]:
+    """Yield token-boundary gaps containing a non-emoji ignorable.
+
+    A token-boundary gap has a word character on exactly one side. This keeps
+    whole-token concealment evidence separate from in-token normalization.
+    """
+    for start, end in _token_bridging_gap_spans(
+        text,
+        require_word_boundaries=False,
+        check_runtime=check_runtime,
+    ):
+        before_is_word = start > 0 and _is_word_character(text[start - 1])
+        after_is_word = end < len(text) and _is_word_character(text[end])
+        if before_is_word == after_is_word:
+            continue
+        for offset in range(start, end):
+            if check_runtime is not None and offset % 4096 == 0:
+                check_runtime()
+            if _is_contextual_default_ignorable_offset(text, offset):
+                yield start, end
+                break
 
 
 def _compact_gap_offsets(text: str) -> Iterator[int]:
