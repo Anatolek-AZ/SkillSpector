@@ -1729,7 +1729,11 @@ def test_nested_env_parameter_assignments_are_scanned_linearly(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     calls = 0
+    scan_calls = 0
+    scanned_characters = 0
+    runtime_checks = 0
     original = tm_module._skip_parameter_expansion
+    original_scan = tm_module._skip_shell_delimited_expansion
 
     def counted(
         content: str,
@@ -1757,16 +1761,37 @@ def test_nested_env_parameter_assignments_are_scanned_linearly(
         )
 
     monkeypatch.setattr(tm_module, "_skip_parameter_expansion", counted)
+
+    def counted_scan(
+        content: str,
+        start: int,
+        limit: int,
+        *args: object,
+        **kwargs: object,
+    ) -> int | None:
+        nonlocal scan_calls, scanned_characters
+        scan_calls += 1
+        end = original_scan(content, start, limit, *args, **kwargs)
+        scanned_characters += max(0, (limit if end is None else end) - start)
+        return end
+
+    def check_runtime() -> None:
+        nonlocal runtime_checks
+        runtime_checks += 1
+
+    monkeypatch.setattr(tm_module, "_skip_shell_delimited_expansion", counted_scan)
     repetitions = 2_000
     content = '$(env "X=${x:- ' * repetitions + "A" + '}" echo printf)' * repetitions + " -rf *"
 
-    started_at = time.perf_counter()
-    exhausted = tm_module.has_bounded_parse_exhaustion(content, lambda: None)
-    elapsed = time.perf_counter() - started_at
+    exhausted = tm_module.has_bounded_parse_exhaustion(content, check_runtime)
 
     assert exhausted is False
     assert calls <= repetitions + 10
-    assert elapsed < _shell_stress_deadline()
+    assert scan_calls <= 2 * repetitions + 20
+    assert scanned_characters <= (
+        2 * len(content) + 2 * repetitions * (tm_module._PRINTF_STATIC_CHARS + 1)
+    )
+    assert runtime_checks <= 8 * repetitions
 
 
 def test_unterminated_nested_substitution_comments_are_scanned_linearly() -> None:
@@ -1781,7 +1806,32 @@ def test_unterminated_nested_substitution_comments_are_scanned_linearly() -> Non
     assert elapsed < 2.0
 
 
-def test_alternating_parameter_and_command_substitutions_are_scanned_linearly() -> None:
+def test_alternating_parameter_and_command_substitutions_are_scanned_linearly(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scan_calls = 0
+    scanned_characters = 0
+    runtime_checks = 0
+    original_scan = tm_module._skip_shell_delimited_expansion
+
+    def counted_scan(
+        content: str,
+        start: int,
+        limit: int,
+        *args: object,
+        **kwargs: object,
+    ) -> int | None:
+        nonlocal scan_calls, scanned_characters
+        scan_calls += 1
+        end = original_scan(content, start, limit, *args, **kwargs)
+        scanned_characters += max(0, (limit if end is None else end) - start)
+        return end
+
+    def check_runtime() -> None:
+        nonlocal runtime_checks
+        runtime_checks += 1
+
+    monkeypatch.setattr(tm_module, "_skip_shell_delimited_expansion", counted_scan)
     repetitions = 4_000
     content = (
         "$(env X="
@@ -1793,12 +1843,14 @@ def test_alternating_parameter_and_command_substitutions_are_scanned_linearly() 
         + " echo printf) -rf /"
     )
 
-    started_at = time.perf_counter()
-    exhausted = tm_module.has_bounded_parse_exhaustion(content, lambda: None)
-    elapsed = time.perf_counter() - started_at
+    exhausted = tm_module.has_bounded_parse_exhaustion(content, check_runtime)
 
     assert exhausted is False
-    assert elapsed < 2.0
+    assert scan_calls <= 2 * repetitions + 20
+    assert scanned_characters <= (
+        2 * len(content) + 2 * repetitions * (tm_module._PRINTF_STATIC_CHARS + 1)
+    )
+    assert runtime_checks <= 4 * repetitions
 
 
 @pytest.mark.parametrize("terminator", ["\n", ";", "# comment\n"])

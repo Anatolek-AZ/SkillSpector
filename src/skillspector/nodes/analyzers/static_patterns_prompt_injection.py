@@ -20,6 +20,7 @@ from __future__ import annotations
 import fnmatch
 import re
 import sys
+from collections.abc import Iterator
 
 from skillspector.artifacts import _is_emoji_base
 from skillspector.logging_config import get_logger
@@ -27,7 +28,7 @@ from skillspector.models import AnalyzerFinding, Location, Severity
 from skillspector.state import AnalyzerNodeResponse, SkillspectorState
 
 from . import static_runner
-from .common import get_context, get_line_number
+from .common import LOGICAL_LINE_BREAK, get_context, get_line_number
 from .pattern_defaults import PatternCategory
 from .whitespace_padding import (
     VERTICAL_HIGH_SEVERITY_LINES,
@@ -82,6 +83,12 @@ P2_PATTERNS = [
     (r"[\u202a-\u202e\u2066-\u2069]", 0.85),
     (r"data:text/plain;base64,[A-Za-z0-9+/=]{50,}", 0.7),
 ]
+_SINGLE_CHARACTER_P2_PATTERNS = frozenset(
+    {
+        _ZERO_WIDTH_PATTERN,
+        r"[\u202a-\u202e\u2066-\u2069]",
+    }
+)
 # P3: Exfiltration Commands
 P3_PATTERNS = [
     (
@@ -201,6 +208,31 @@ def _zero_width_match_is_safe_emoji_zwj(content: str, offset: int) -> bool:
     )
 
 
+def _p2_pattern_matches(content: str, pattern: str) -> Iterator[re.Match[str]]:
+    """Yield all structured matches or the first control signal on each line."""
+    compiled = re.compile(pattern, re.IGNORECASE | re.DOTALL)
+    if pattern not in _SINGLE_CHARACTER_P2_PATTERNS:
+        yield from compiled.finditer(content)
+        return
+
+    cursor = 0
+    while cursor < len(content):
+        match = compiled.search(content, cursor)
+        if match is None:
+            return
+        if pattern == _ZERO_WIDTH_PATTERN and _zero_width_match_is_safe_emoji_zwj(
+            content,
+            match.start(),
+        ):
+            cursor = match.end()
+            continue
+        yield match
+        line_break = LOGICAL_LINE_BREAK.search(content, match.end())
+        if line_break is None:
+            return
+        cursor = line_break.end()
+
+
 def _first_smuggled_tag_offset(content: str) -> int | None:
     """Return the char offset of the first Unicode Tag character that is *not*
     part of a well-formed emoji tag sequence, or ``None`` if there is none."""
@@ -244,11 +276,7 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
             )
     if file_type in ("markdown", "other"):
         for pattern, confidence in P2_PATTERNS:
-            for match in re.finditer(pattern, content, re.IGNORECASE | re.DOTALL):
-                if pattern == _ZERO_WIDTH_PATTERN and _zero_width_match_is_safe_emoji_zwj(
-                    content, match.start()
-                ):
-                    continue
+            for match in _p2_pattern_matches(content, pattern):
                 line_num = get_line_number(content, match.start())
                 findings.append(
                     AnalyzerFinding(

@@ -222,6 +222,9 @@ _DEFAULT_IGNORABLE_RANGES = (
     (0x1D173, 0x1D17A),
     (0xE0000, 0xE0FFF),
 )
+_DEFAULT_IGNORABLE_CODEPOINTS = frozenset(
+    codepoint for start, end in _DEFAULT_IGNORABLE_RANGES for codepoint in range(start, end + 1)
+)
 _DEFAULT_IGNORABLE_PATTERN = re.compile(
     "["
     + "".join(
@@ -230,6 +233,8 @@ _DEFAULT_IGNORABLE_PATTERN = re.compile(
     )
     + "]"
 )
+_DEFAULT_IGNORABLE_RUN_PATTERN = re.compile(_DEFAULT_IGNORABLE_PATTERN.pattern + "+")
+_REPEATED_CHARACTER_RUN_PATTERN = re.compile(r"(.)\1+")
 _ASCII_CONFUSABLE_PATTERN = re.compile(
     "[" + "".join(re.escape(chr(codepoint)) for codepoint in ASCII_CONFUSABLE_SKELETON) + "]"
 )
@@ -339,13 +344,7 @@ def _is_emoji_base(ch: str) -> bool:
 
 def is_default_ignorable(ch: str) -> bool:
     """Return the pinned Unicode Default_Ignorable_Code_Point property."""
-    codepoint = ord(ch)
-    for start, end in _DEFAULT_IGNORABLE_RANGES:
-        if codepoint < start:
-            return False
-        if codepoint <= end:
-            return True
-    return False
+    return ord(ch) in _DEFAULT_IGNORABLE_CODEPOINTS
 
 
 def _contains_default_ignorable(text: str) -> bool:
@@ -884,6 +883,25 @@ def _is_existing_projection_gap_character(character: str) -> bool:
     )
 
 
+def _existing_projection_run_end(text: str, start: int) -> int | None:
+    """Return the end of a gap run whose DP transition is idempotent."""
+    character = text[start]
+    if is_default_ignorable(character):
+        match = _DEFAULT_IGNORABLE_RUN_PATTERN.match(text, start)
+        return match.end() if match is not None else None
+    if (
+        character in _LOGICAL_LINE_BREAK_CHARACTERS
+        or character.isalpha()
+        or character.isascii()
+        and character.isspace()
+        or not _is_existing_projection_gap_character(character)
+        or _fold_security_character(character)
+    ):
+        return None
+    match = _REPEATED_CHARACTER_RUN_PATTERN.match(text, start)
+    return match.end() if match is not None else None
+
+
 def _match_obfuscated_security_word(
     text: str,
     start: int,
@@ -1237,6 +1255,7 @@ def _obfuscated_action_completions(
 
         _check_security_runtime(check_runtime, cursor)
         character = text[cursor]
+        run_end = _existing_projection_run_end(text, cursor) if states else None
         skeleton = _fold_security_character(character)
         next_states: dict[tuple[str, int], tuple[_ObfuscatedIgnoreState, ...]] = {}
         completions: list[tuple[str, int, int, tuple[tuple[int, int], ...], bool]] = []
@@ -1321,7 +1340,7 @@ def _obfuscated_action_completions(
                     )
 
         states = next_states
-        cursor += 1
+        cursor = run_end if run_end is not None else cursor + 1
         yield from completions
 
 
@@ -1441,6 +1460,11 @@ def _token_bridging_gap_spans(
         while offset < len(text) and _is_token_gap_character(text[offset]):
             if check_runtime is not None and offset % 4096 == 0:
                 check_runtime()
+            if is_default_ignorable(text[offset]):
+                run = _DEFAULT_IGNORABLE_RUN_PATTERN.match(text, offset)
+                if run is not None:
+                    offset = run.end()
+                    continue
             offset += 1
         before_is_word = start > 0 and _is_word_character(text[start - 1])
         after_is_word = offset < len(text) and _is_word_character(text[offset])
@@ -1471,12 +1495,68 @@ def _is_contextual_default_ignorable_offset(text: str, offset: int) -> bool:
     )
 
 
+def _contextual_default_ignorable_spans(text: str) -> Iterator[tuple[int, int]]:
+    """Yield removable ignorable spans without walking homogeneous runs in Python."""
+    for gap_start, gap_end in _token_bridging_gap_spans(
+        text,
+        require_word_boundaries=False,
+    ):
+        for match in _DEFAULT_IGNORABLE_RUN_PATTERN.finditer(text, gap_start, gap_end):
+            start, end = match.span()
+            character = text[start]
+            if text.count(character, start, end) == end - start:
+                if _is_unconditionally_ignored(character):
+                    continue
+                contextual_start = (
+                    start if _is_contextual_default_ignorable_offset(text, start) else start + 1
+                )
+                contextual_end = (
+                    end if _is_contextual_default_ignorable_offset(text, end - 1) else end - 1
+                )
+                if contextual_start < contextual_end:
+                    yield contextual_start, contextual_end
+                continue
+
+            span_start: int | None = None
+            for offset in range(start, end):
+                if _is_contextual_default_ignorable_offset(text, offset):
+                    if span_start is None:
+                        span_start = offset
+                elif span_start is not None:
+                    yield span_start, offset
+                    span_start = None
+            if span_start is not None:
+                yield span_start, end
+
+
+def _normalization_ignored_spans(text: str) -> Iterator[tuple[int, int]]:
+    """Yield whole default-ignorable runs removable by the normalized view."""
+    for gap_start, gap_end in _token_bridging_gap_spans(
+        text,
+        require_word_boundaries=False,
+    ):
+        for match in _DEFAULT_IGNORABLE_RUN_PATTERN.finditer(text, gap_start, gap_end):
+            start, end = match.span()
+            ignored_start = (
+                start
+                if _is_unconditionally_ignored(text[start])
+                or _is_contextual_default_ignorable_offset(text, start)
+                else start + 1
+            )
+            ignored_end = (
+                end
+                if _is_unconditionally_ignored(text[end - 1])
+                or _is_contextual_default_ignorable_offset(text, end - 1)
+                else end - 1
+            )
+            if ignored_start < ignored_end:
+                yield ignored_start, ignored_end
+
+
 def _contextual_default_ignorable_offsets(text: str) -> Iterator[int]:
     """Yield non-format default-ignorables next to text without altering emoji forms."""
-    for start, end in _token_bridging_gap_spans(text, require_word_boundaries=False):
-        for offset in range(start, end):
-            if _is_contextual_default_ignorable_offset(text, offset):
-                yield offset
+    for start, end in _contextual_default_ignorable_spans(text):
+        yield from range(start, end)
 
 
 def _contextual_default_ignorable_boundary_spans(
@@ -1513,6 +1593,11 @@ def _contextual_default_ignorable_boundary_spans(
 def _compact_gap_offsets(text: str) -> Iterator[int]:
     """Yield word-bounded separator runs that the compact view may remove."""
     for start, end in _token_bridging_gap_spans(text):
+        character = text[start]
+        if text.count(character, start, end) == end - start:
+            if _is_non_ascii_separator(character):
+                yield from range(start, end)
+            continue
         if any(_is_non_ascii_separator(text[offset]) for offset in range(start, end)):
             yield from range(start, end)
 
@@ -1525,18 +1610,23 @@ def normalized_security_view(text: str) -> SecurityTextView:
     """Build an NFKC/UTS #39 ASCII-skeleton view with compact offsets."""
     output = StringIO()
     offsets = array("I")
-    contextual_offsets = iter(_contextual_default_ignorable_offsets(text))
-    next_contextual = _next_offset(contextual_offsets)
-    for source_offset, ch in enumerate(text):
-        is_contextual = source_offset == next_contextual
-        if is_contextual:
-            next_contextual = _next_offset(contextual_offsets)
-        if _is_unconditionally_ignored(ch) or is_contextual:
+    contextual_spans = iter(_normalization_ignored_spans(text))
+    next_contextual = next(contextual_spans, None)
+    source_offset = 0
+    while source_offset < len(text):
+        if next_contextual is not None and source_offset == next_contextual[0]:
+            source_offset = next_contextual[1]
+            next_contextual = next(contextual_spans, None)
+            continue
+        ch = text[source_offset]
+        if _is_unconditionally_ignored(ch):
+            source_offset += 1
             continue
         normalized = unicodedata.normalize("NFKC", ch).translate(ASCII_CONFUSABLE_SKELETON)
         for normalized_char in normalized:
             output.write(normalized_char)
             offsets.append(source_offset)
+        source_offset += 1
     return SecurityTextView("normalized", output.getvalue(), offsets)
 
 
