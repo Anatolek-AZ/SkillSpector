@@ -25,7 +25,6 @@ Framework: ASI02.
 from __future__ import annotations
 
 import re
-import shlex
 import sys
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
@@ -42,13 +41,18 @@ logger = get_logger(__name__)
 
 ANALYZER_ID = "static_patterns_tool_misuse"
 
-_SHELL_COMMAND_WORD_START_RE = re.compile(r"[rR$'\"`\\]")
+_SHELL_COMMAND_WORD_START_RE = re.compile(r"[rRdDeE$'\"`\\]")
 _SHELL_COMMAND_WORD_CHARS = 4096
 _ROOT_GLOB_COMMAND_CHARS = 8192
+_SHELL_HORIZONTAL_OR_CONTINUED_GAP = r"(?>(?:\\\r?\n)*[ \t](?:[ \t]|\\\r?\n)*)"
+_BOUNDED_SHELL_CLAUSE_ATOM = r"(?:\\(?:\r?\n|[^\n])|[^\\\n|;&])"
 _STATIC_BRACE_WORD_CHARS = 256
+_PRINTF_STATIC_CHARS = 256
 _PRINTF_STATIC_ARGUMENTS = 32
 _PRINTF_STATIC_WORD_RE = re.compile(r"[-A-Za-z0-9_./*?%]{0,64}")
+_DESTRUCTIVE_COMMAND_BASENAMES = frozenset({"rm", "del", "erase"})
 _QUOTED_GLOB_SENTINEL = "\ue000"
+_DYNAMIC_SHELL_WORD_SENTINEL = "\ue001"
 _ROOT_GLOB_DOCUMENTATION_LINE_RE = re.compile(
     r"[ \t]*(?:(?:[-*+]|#{1,6})[ \t]+)?"
     r"(?:(?:(?:documentation|note|example)[ \t]*:[ \t]*)"
@@ -104,7 +108,16 @@ TM1_PATTERNS = [
     (r"Popen\s*\([^)]*shell\s*=\s*True", 0.8),
     # Bound command names on both sides so prefixes such as rmm/ (RAPIDS
     # Memory Manager headers) are not interpreted as destructive commands.
-    (r"\b(?:rm\b|del\b|erase\b)\s+[^|]*-(?:r|rf|fr)\s+[/~]", 0.9),
+    # Keep the scan within one bounded shell command.  The former ``[^|]*``
+    # crossed newlines/``;``/``&`` and rescanned the remainder of a document
+    # for every prose mention of ``rm``, making repeated documentation
+    # quadratic.  Escaped newlines remain valid shell continuations.
+    (
+        rf"\b(?:rm|del|erase)\b{_SHELL_HORIZONTAL_OR_CONTINUED_GAP}"
+        rf"{_BOUNDED_SHELL_CLAUSE_ATOM}{{0,{_ROOT_GLOB_COMMAND_CHARS}}}"
+        rf"(?:\\)?-(?:rf|fr|r){_SHELL_HORIZONTAL_OR_CONTINUED_GAP}[/~]",
+        0.9,
+    ),
     (r"--force\s+(?:delete|remove|push|reset|clean)", 0.7),
     # A bare application-defined --no-verify flag is ambiguous. Match it only
     # for known Git hook bypasses below; retain the other explicit unsafe flags.
@@ -294,6 +307,7 @@ class _ShellToken:
     glob_projection: str
     has_quoted_content: bool
     brace_expansion: bool
+    leading_tilde_unquoted: bool
 
 
 @dataclass(frozen=True)
@@ -302,6 +316,27 @@ class _ShellCommandWord:
     end: int
     dynamic: bool
     limited: bool = False
+
+
+@dataclass(frozen=True)
+class _ParameterExpansionEnd:
+    """Cached parameter endpoint plus its enclosing-quote transition."""
+
+    end: int | None
+    inherited_quote_closed: bool = False
+
+
+@dataclass
+class _ShellDelimiterFrame:
+    """One iterative shell-expansion delimiter frame."""
+
+    kind: str
+    start: int | None
+    quote: str | None = None
+    ansi_c_quote: bool = False
+    word_started: bool = False
+    inherited_double_quote: bool = False
+    inherited_quote_closed: bool = False
 
 
 def _is_shell_command_word_start(content: str, start: int) -> bool:
@@ -318,6 +353,19 @@ def _is_shell_command_word_start(content: str, start: int) -> bool:
             or content[before_quote] in ";|&()<>{}/"
         )
     return False
+
+
+def _has_quoted_assignment_prefix(content: str, start: int) -> bool:
+    """Return whether a quoted candidate starts with a shell assignment name."""
+    if start >= len(content) or content[start] not in "'\"":
+        return False
+    cursor = start + 1
+    if cursor >= len(content) or not (content[cursor].isalpha() or content[cursor] == "_"):
+        return False
+    cursor += 1
+    while cursor < len(content) and (content[cursor].isalnum() or content[cursor] == "_"):
+        cursor += 1
+    return cursor < len(content) and content[cursor] == "="
 
 
 def _decode_ansi_c_escape(content: str, start: int, limit: int) -> tuple[str, int]:
@@ -378,22 +426,257 @@ def _skip_ansi_c_quote_tail(content: str, start: int, limit: int) -> int | None:
     return None
 
 
-def _skip_parameter_expansion(content: str, start: int, limit: int) -> int | None:
+def _skip_shell_delimited_expansion(
+    content: str,
+    start: int,
+    limit: int,
+    root_kind: str,
+    check_runtime: Callable[[], None] | None,
+    parameter_end_cache: dict[int, _ParameterExpansionEnd] | None,
+    substitution_end_cache: dict[int, int | None] | None,
+    backtick_end_cache: dict[int, int | None] | None,
+    root_inherited_double_quote: bool = False,
+    inherited_quote_closed: list[bool] | None = None,
+) -> int | None:
+    """Skip nested shell delimiters iteratively and cache every typed endpoint."""
+    opener_width = 1 if root_kind == "backtick" else 2
+    frames = [
+        _ShellDelimiterFrame(
+            root_kind,
+            start,
+            inherited_double_quote=root_inherited_double_quote,
+        )
+    ]
+    cursor = start + opener_width
+
+    def cache_frame(frame: _ShellDelimiterFrame, end: int | None) -> None:
+        if frame.start is None:
+            return
+        if frame.kind == "parameter" and parameter_end_cache is not None:
+            parameter_end_cache[frame.start] = _ParameterExpansionEnd(
+                end,
+                frame.inherited_quote_closed,
+            )
+        elif frame.kind == "command" and substitution_end_cache is not None:
+            substitution_end_cache[frame.start] = end
+        elif frame.kind == "backtick" and backtick_end_cache is not None:
+            backtick_end_cache[frame.start] = end
+
+    def cache_failure() -> None:
+        for frame in frames:
+            cache_frame(frame, None)
+
+    def close_frame(end: int) -> int | None:
+        frame = frames.pop()
+        cache_frame(frame, end)
+        return end if not frames else None
+
+    def push(kind: str, frame_start: int | None, width: int) -> None:
+        nonlocal cursor
+        parent = frames[-1]
+        if kind in {"parameter", "command", "backtick"} and parent.kind in {
+            "command",
+            "paren",
+        }:
+            parent.word_started = True
+        inherited_double_quote = kind in {"parameter", "brace"} and (
+            parent.quote == '"'
+            or (
+                parent.inherited_double_quote
+                and parent.kind in {"parameter", "brace"}
+                and parent.quote is None
+            )
+        )
+        frames.append(
+            _ShellDelimiterFrame(
+                kind,
+                frame_start,
+                inherited_double_quote=inherited_double_quote,
+            )
+        )
+        cursor += width
+
+    while cursor < limit:
+        if check_runtime is not None and cursor % 4096 == 0:
+            check_runtime()
+        frame = frames[-1]
+        character = content[cursor]
+
+        if frame.kind == "backtick":
+            if character == "\\" and cursor + 1 < limit:
+                cursor += 2
+                continue
+            if character == "`":
+                endpoint = close_frame(cursor + 1)
+                cursor += 1
+                if endpoint is not None:
+                    return endpoint
+                continue
+            cursor += 1
+            continue
+
+        if frame.quote is not None:
+            if frame.quote == '"' and content.startswith("${", cursor):
+                push("parameter", cursor, 2)
+                continue
+            if frame.quote == '"' and content.startswith("$(", cursor):
+                push("command", cursor, 2)
+                continue
+            if frame.quote == '"' and character == "`":
+                push("backtick", cursor, 1)
+                continue
+            if character == frame.quote:
+                frame.quote = None
+                frame.ansi_c_quote = False
+            elif character == "\\" and frame.ansi_c_quote:
+                _, cursor = _decode_ansi_c_escape(content, cursor, limit)
+                continue
+            elif character == "\\" and frame.quote == '"' and cursor + 1 < limit:
+                cursor += 2
+                continue
+            cursor += 1
+            continue
+
+        if content.startswith("${", cursor):
+            push("parameter", cursor, 2)
+            continue
+        if content.startswith("$(", cursor):
+            push("command", cursor, 2)
+            continue
+        if character in "<>" and cursor + 1 < limit and content[cursor + 1] == "(":
+            push("command", cursor, 2)
+            continue
+        if character == "`":
+            push("backtick", cursor, 1)
+            continue
+        if (
+            character == "$"
+            and cursor + 1 < limit
+            and content[cursor + 1] in "'\""
+            and not (
+                frame.inherited_double_quote
+                and frame.kind in {"parameter", "brace"}
+                and content[cursor + 1] in "'\""
+            )
+        ):
+            frame.quote = content[cursor + 1]
+            frame.ansi_c_quote = frame.quote == "'"
+            if frame.kind in {"command", "paren"}:
+                frame.word_started = True
+            cursor += 2
+            continue
+        if (
+            character == '"'
+            and frame.inherited_double_quote
+            and frame.kind in {"parameter", "brace"}
+        ):
+            # In ksh, $" inside a parameter expansion inherited from a
+            # double-quoted word is a literal '$' followed by the closing
+            # quote.  Do not mistake that quote for the start of a new
+            # locale-translation string, or the scanner can hide commands
+            # that follow the parameter expansion.
+            frame.inherited_double_quote = False
+            frame.inherited_quote_closed = True
+            if inherited_quote_closed is not None:
+                inherited_quote_closed[0] = True
+            for parent in reversed(frames[:-1]):
+                if parent.kind in {"parameter", "brace"}:
+                    parent.inherited_double_quote = False
+                    parent.inherited_quote_closed = True
+                if parent.quote == '"':
+                    parent.quote = None
+                    parent.ansi_c_quote = False
+                    break
+            cursor += 1
+            continue
+        if character in "'\"" and not (
+            character == "'"
+            and frame.inherited_double_quote
+            and frame.kind in {"parameter", "brace"}
+        ):
+            frame.quote = character
+            frame.ansi_c_quote = False
+            if frame.kind in {"command", "paren"}:
+                frame.word_started = True
+            cursor += 1
+            continue
+        if character == "\\" and cursor + 1 < limit:
+            if frame.kind in {"command", "paren"}:
+                frame.word_started = True
+            cursor += 2
+            continue
+
+        if frame.kind in {"parameter", "brace"}:
+            if character == "{":
+                push("brace", None, 1)
+                continue
+            if character == "}":
+                endpoint = close_frame(cursor + 1)
+                cursor += 1
+                if endpoint is not None:
+                    return endpoint
+                continue
+            cursor += 1
+            continue
+
+        if character == "(":
+            push("paren", None, 1)
+            continue
+        if character == ")":
+            endpoint = close_frame(cursor + 1)
+            cursor += 1
+            if endpoint is not None:
+                return endpoint
+            continue
+        if character == "#" and not frame.word_started:
+            newline = content.find("\n", cursor + 1, limit)
+            if newline < 0:
+                cache_failure()
+                return None
+            cursor = newline
+            continue
+        if character.isspace() or character in ";|&":
+            frame.word_started = False
+        else:
+            frame.word_started = True
+        cursor += 1
+
+    cache_failure()
+    return None
+
+
+def _skip_parameter_expansion(
+    content: str,
+    start: int,
+    limit: int,
+    check_runtime: Callable[[], None] | None = None,
+    end_cache: dict[int, _ParameterExpansionEnd] | None = None,
+    substitution_end_cache: dict[int, int | None] | None = None,
+    backtick_end_cache: dict[int, int | None] | None = None,
+    inherited_double_quote: bool = False,
+    inherited_quote_closed: list[bool] | None = None,
+) -> int | None:
+    if end_cache is not None and start in end_cache:
+        cached = end_cache[start]
+        if inherited_quote_closed is not None:
+            inherited_quote_closed[0] = cached.inherited_quote_closed
+        return cached.end
     if start + 1 >= limit or content[start] != "$":
         return None
     next_character = content[start + 1]
     if next_character == "{":
-        cursor = start + 2
-        depth = 1
-        while cursor < limit:
-            if content[cursor] == "{":
-                depth += 1
-            elif content[cursor] == "}":
-                depth -= 1
-                if depth == 0:
-                    return cursor + 1
-            cursor += 1
-        return None
+        return _skip_shell_delimited_expansion(
+            content,
+            start,
+            limit,
+            "parameter",
+            check_runtime,
+            end_cache,
+            substitution_end_cache,
+            backtick_end_cache,
+            inherited_double_quote,
+            inherited_quote_closed,
+        )
     if next_character.isalpha() or next_character == "_":
         cursor = start + 2
         while cursor < limit and (content[cursor].isalnum() or content[cursor] == "_"):
@@ -408,58 +691,352 @@ def _is_ifs_expansion(content: str, start: int, end: int) -> bool:
     return content[start:end] in {"$IFS", "${IFS}"}
 
 
-def _printf_invocation_arguments(inner: str) -> tuple[bool, list[str]]:
-    """Parse direct or allowlisted wrapper invocations of shell ``printf``."""
-    try:
-        words = shlex.split(inner, comments=False, posix=True)
-    except ValueError:
-        return False, []
-    if not words:
-        return False, []
-
-    index = 0
+def _consume_printf_invocation(
+    next_word: Callable[[], str | None],
+) -> tuple[bool, bool]:
+    """Resolve an allowlisted invocation; return ``(recognized, exact)``."""
+    pending: str | None = None
     for _ in range(4):
-        if index >= len(words):
-            return False, []
-        command = words[index].casefold().rsplit("/", 1)[-1]
-        index += 1
+        word = pending if pending is not None else next_word()
+        pending = None
+        if word is None:
+            return False, False
+        if _DYNAMIC_SHELL_WORD_SENTINEL in word:
+            # A runtime expansion participates in the invocation or wrapper
+            # command word. Its executable basename is not deterministic.
+            return True, False
+        command = word.casefold().rsplit("/", 1)[-1]
         if command == "printf":
-            return True, words[index:]
+            return True, True
         if command == "command":
-            while index < len(words) and words[index] in {"--", "-p"}:
-                index += 1
-            if index < len(words) and words[index].startswith("-"):
-                return False, []
+            while True:
+                word = next_word()
+                if word == "-p":
+                    continue
+                if word == "--":
+                    word = next_word()
+                break
+            if word is None or word.startswith("-"):
+                return False, False
+            pending = word
             continue
         if command == "builtin":
-            if index < len(words) and words[index] == "--":
-                index += 1
-            if index < len(words) and words[index].startswith("-"):
-                return False, []
+            word = next_word()
+            if word == "--":
+                word = next_word()
+            if word is None or word.startswith("-"):
+                return False, False
+            pending = word
             continue
         if command != "env":
-            return False, []
-        while index < len(words):
-            word = words[index]
+            return False, False
+        while (word := next_word()) is not None:
             if word == "--":
-                index += 1
+                pending = next_word()
                 break
-            if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", word) is not None:
-                index += 1
+            # ``env`` assignment values may contain quoted newlines and other
+            # characters. Only the portable name and first ``=`` determine
+            # whether this word is an assignment operand.
+            if re.match(r"[A-Za-z_][A-Za-z0-9_]*=", word) is not None:
                 continue
             if word in {"-i", "--ignore-environment"}:
-                index += 1
                 continue
-            if word in {"-u", "--unset", "-C", "--chdir"} and index + 1 < len(words):
-                index += 2
+            if word in {"-u", "--unset", "-C", "--chdir"}:
+                if next_word() is None:
+                    return True, False
                 continue
             if re.fullmatch(r"(?:--unset|--chdir)=.+", word) is not None:
-                index += 1
                 continue
             if word.startswith("-"):
-                return True, []
+                # Preserve the existing fail-closed contract for unsupported
+                # env options even though the final command cannot be resolved.
+                return True, False
+            pending = word
             break
-    return False, []
+        if pending is None:
+            return False, False
+    # The allowlisted wrapper chain exceeded the deterministic depth budget.
+    # Treat it as recognized but inexact so callers record a coverage gap
+    # instead of silently declaring a potentially reconstructed command safe.
+    return True, False
+
+
+def _printf_invocation_arguments(inner: str) -> tuple[bool, list[str]]:
+    """Parse direct or allowlisted wrapper invocations of shell ``printf``."""
+    cursor = 0
+    limited = False
+
+    def next_word() -> str | None:
+        nonlocal cursor, limited
+        word, cursor, word_limited = _next_shell_invocation_word(
+            inner,
+            cursor,
+            lambda: None,
+        )
+        limited = limited or word_limited or (word is None and cursor < len(inner))
+        return word
+
+    recognized, exact = _consume_printf_invocation(next_word)
+    if not recognized or not exact or limited:
+        return recognized, []
+
+    arguments: list[str] = []
+    while cursor < len(inner):
+        word = next_word()
+        if word is None:
+            return (True, []) if limited or cursor < len(inner) else (True, arguments)
+        arguments.append(word)
+    return True, arguments
+
+
+def _next_shell_invocation_word(
+    content: str,
+    start: int,
+    check_runtime: Callable[[], None],
+    parameter_end_cache: dict[int, _ParameterExpansionEnd] | None = None,
+    substitution_end_cache: dict[int, int | None] | None = None,
+    backtick_end_cache: dict[int, int | None] | None = None,
+) -> tuple[str | None, int, bool]:
+    """Read one direct shell word without traversing nested substitutions."""
+    cursor = start
+    limit = len(content)
+    while cursor < limit:
+        if cursor % 4096 == 0:
+            check_runtime()
+        if content[cursor].isspace():
+            cursor += 1
+            continue
+        if content.startswith("\\\r\n", cursor):
+            cursor += 3
+            continue
+        if content.startswith("\\\n", cursor):
+            cursor += 2
+            continue
+        break
+    if cursor >= limit or content[cursor] in ");|&()<>":
+        return None, cursor, False
+
+    output: list[str] = []
+    quote: str | None = None
+    ansi_c_quote = False
+    word_started = False
+    while cursor < limit:
+        if cursor % 4096 == 0:
+            check_runtime()
+        character = content[cursor]
+        if quote is not None:
+            if character == quote:
+                quote = None
+                ansi_c_quote = False
+            elif character == "\\" and ansi_c_quote:
+                decoded, cursor = _decode_ansi_c_escape(content, cursor, limit)
+                if "\x00" in decoded:
+                    closing_quote = _skip_ansi_c_quote_tail(content, cursor, limit)
+                    if closing_quote is None:
+                        return None, cursor, True
+                    cursor = closing_quote
+                    continue
+                output.append(decoded)
+                word_started = True
+                continue
+            elif quote == '"' and character == "\\" and cursor + 1 < limit:
+                escaped = content[cursor + 1]
+                if escaped == "\n":
+                    cursor += 2
+                    continue
+                if escaped == "\r" and cursor + 2 < limit and content[cursor + 2] == "\n":
+                    cursor += 3
+                    continue
+                if escaped in '$`"\\':
+                    output.append(escaped)
+                else:
+                    output.extend(("\\", escaped))
+                cursor += 2
+                continue
+            elif quote == '"' and character == "$":
+                inherited_quote_closed = [False]
+                if cursor + 1 < limit and content[cursor + 1] == "(":
+                    parameter_end = _skip_command_substitution(
+                        content,
+                        cursor,
+                        limit,
+                        check_runtime,
+                        substitution_end_cache,
+                        parameter_end_cache,
+                        backtick_end_cache,
+                    )
+                else:
+                    parameter_end = _skip_parameter_expansion(
+                        content,
+                        cursor,
+                        limit,
+                        check_runtime,
+                        parameter_end_cache,
+                        substitution_end_cache,
+                        backtick_end_cache,
+                        True,
+                        inherited_quote_closed,
+                    )
+                if parameter_end is None:
+                    if cursor + 1 < limit and content[cursor + 1] in "({":
+                        return None, cursor, True
+                    output.append("$")
+                    word_started = True
+                    cursor += 1
+                    continue
+                output.append(_DYNAMIC_SHELL_WORD_SENTINEL)
+                word_started = True
+                cursor = parameter_end
+                if inherited_quote_closed[0]:
+                    quote = None
+                    ansi_c_quote = False
+                continue
+            elif quote == '"' and character == "`":
+                substitution_end = _skip_backtick_substitution(
+                    content,
+                    cursor,
+                    limit,
+                    check_runtime,
+                    backtick_end_cache,
+                    parameter_end_cache,
+                    substitution_end_cache,
+                )
+                if substitution_end is None:
+                    return None, cursor, True
+                output.append(_DYNAMIC_SHELL_WORD_SENTINEL)
+                word_started = True
+                cursor = substitution_end
+                continue
+            else:
+                output.append(character)
+        elif character in "'\"":
+            quote = character
+            ansi_c_quote = False
+            word_started = True
+        elif character == "\\" and cursor + 1 < limit:
+            escaped = content[cursor + 1]
+            if escaped == "\n":
+                cursor += 2
+                continue
+            if escaped == "\r" and cursor + 2 < limit and content[cursor + 2] == "\n":
+                cursor += 3
+                continue
+            output.append(escaped)
+            word_started = True
+            cursor += 2
+            continue
+        elif character == "$":
+            if cursor + 1 < limit and content[cursor + 1] in "'\"":
+                quote = content[cursor + 1]
+                ansi_c_quote = quote == "'"
+                word_started = True
+                cursor += 2
+                continue
+            if cursor + 1 < limit and content[cursor + 1] == "(":
+                parameter_end = _skip_command_substitution(
+                    content,
+                    cursor,
+                    limit,
+                    check_runtime,
+                    substitution_end_cache,
+                    parameter_end_cache,
+                    backtick_end_cache,
+                )
+            else:
+                parameter_end = _skip_parameter_expansion(
+                    content,
+                    cursor,
+                    limit,
+                    check_runtime,
+                    parameter_end_cache,
+                    substitution_end_cache,
+                    backtick_end_cache,
+                )
+            if parameter_end is None:
+                if cursor + 1 < limit and content[cursor + 1] in "({":
+                    return None, cursor, True
+                output.append("$")
+                word_started = True
+                cursor += 1
+                continue
+            output.append(_DYNAMIC_SHELL_WORD_SENTINEL)
+            word_started = True
+            cursor = parameter_end
+            continue
+        elif character == "`":
+            substitution_end = _skip_backtick_substitution(
+                content,
+                cursor,
+                limit,
+                check_runtime,
+                backtick_end_cache,
+                parameter_end_cache,
+                substitution_end_cache,
+            )
+            if substitution_end is None:
+                return None, cursor, True
+            output.append(_DYNAMIC_SHELL_WORD_SENTINEL)
+            word_started = True
+            cursor = substitution_end
+            continue
+        elif character in "<>" and cursor + 1 < limit and content[cursor + 1] == "(":
+            substitution_end = _skip_command_substitution(
+                content,
+                cursor,
+                limit,
+                check_runtime,
+                substitution_end_cache,
+                parameter_end_cache,
+                backtick_end_cache,
+            )
+            if substitution_end is None:
+                return None, cursor, True
+            output.append(_DYNAMIC_SHELL_WORD_SENTINEL)
+            word_started = True
+            cursor = substitution_end
+            continue
+        elif character.isspace() or character in ";|&()<>":
+            break
+        elif character == "#" and not word_started:
+            return None, cursor, False
+        else:
+            output.append(character)
+            word_started = True
+            if len(output) > _SHELL_COMMAND_WORD_CHARS:
+                return None, cursor, True
+        cursor += 1
+    if quote is not None:
+        return None, cursor, True
+    return "".join(output) if word_started else None, cursor, False
+
+
+def _has_printf_invocation_prefix(
+    content: str,
+    start: int,
+    check_runtime: Callable[[], None],
+    parameter_end_cache: dict[int, _ParameterExpansionEnd],
+    substitution_end_cache: dict[int, int | None],
+    backtick_end_cache: dict[int, int | None],
+) -> bool:
+    """Recognize over-bound direct ``printf`` without copying or suffix rescans."""
+    cursor = start + 2
+    limited = False
+
+    def next_word() -> str | None:
+        nonlocal cursor, limited
+        word, cursor, word_limited = _next_shell_invocation_word(
+            content,
+            cursor,
+            check_runtime,
+            parameter_end_cache,
+            substitution_end_cache,
+            backtick_end_cache,
+        )
+        limited = limited or word_limited
+        return word
+
+    recognized, _ = _consume_printf_invocation(next_word)
+    return recognized or limited
 
 
 def _static_printf_substitution(
@@ -474,7 +1051,11 @@ def _static_printf_substitution(
     inner_end = end - 1
     inner = content[inner_start:inner_end]
     recognized, arguments = _printf_invocation_arguments(inner)
-    if not recognized or len(inner) > 256 or re.search(r"[;|&<>$`\r\n]", inner) is not None:
+    if (
+        not recognized
+        or len(inner) > _PRINTF_STATIC_CHARS
+        or re.search(r"[;|&<>\r\n]", inner) is not None
+    ):
         return None
     if arguments[:1] == ["--"]:
         arguments = arguments[1:]
@@ -535,19 +1116,36 @@ def _is_printf_substitution(
     return recognized
 
 
-def _skip_backtick_substitution(content: str, start: int, limit: int) -> int | None:
-    cursor = start + 1
-    while cursor < limit:
-        if content[cursor] == "\\" and cursor + 1 < limit:
-            cursor += 2
-            continue
-        if content[cursor] == "`":
-            return cursor + 1
-        cursor += 1
-    return None
+def _skip_backtick_substitution(
+    content: str,
+    start: int,
+    limit: int,
+    check_runtime: Callable[[], None] | None = None,
+    end_cache: dict[int, int | None] | None = None,
+    parameter_end_cache: dict[int, _ParameterExpansionEnd] | None = None,
+    substitution_end_cache: dict[int, int | None] | None = None,
+) -> int | None:
+    if end_cache is not None and start in end_cache:
+        return end_cache[start]
+    return _skip_shell_delimited_expansion(
+        content,
+        start,
+        limit,
+        "backtick",
+        check_runtime,
+        parameter_end_cache,
+        substitution_end_cache,
+        end_cache,
+    )
 
 
-def _parse_shell_command_word(content: str, start: int) -> _ShellCommandWord | None:
+def _parse_shell_command_word(
+    content: str,
+    start: int,
+    parameter_end_cache: dict[int, _ParameterExpansionEnd] | None = None,
+    substitution_end_cache: dict[int, int | None] | None = None,
+    backtick_end_cache: dict[int, int | None] | None = None,
+) -> _ShellCommandWord | None:
     output: list[str] = []
     quote: str | None = None
     ansi_c_quote = False
@@ -572,8 +1170,16 @@ def _parse_shell_command_word(content: str, start: int) -> _ShellCommandWord | N
                 output.append(decoded)
                 continue
             elif quote == '"' and character == "$" and cursor + 1 < limit:
+                inherited_quote_closed = [False]
                 if content[cursor + 1] == "(":
-                    substitution_end = _skip_command_substitution(content, cursor, limit)
+                    substitution_end = _skip_command_substitution(
+                        content,
+                        cursor,
+                        limit,
+                        end_cache=substitution_end_cache,
+                        parameter_end_cache=parameter_end_cache,
+                        backtick_end_cache=backtick_end_cache,
+                    )
                     if substitution_end is None:
                         return None
                     static_value = _static_printf_substitution(
@@ -593,14 +1199,33 @@ def _parse_shell_command_word(content: str, start: int) -> _ShellCommandWord | N
                         output.append(static_value)
                     cursor = substitution_end
                     continue
-                parameter_end = _skip_parameter_expansion(content, cursor, limit)
+                parameter_end = _skip_parameter_expansion(
+                    content,
+                    cursor,
+                    limit,
+                    end_cache=parameter_end_cache,
+                    substitution_end_cache=substitution_end_cache,
+                    backtick_end_cache=backtick_end_cache,
+                    inherited_double_quote=True,
+                    inherited_quote_closed=inherited_quote_closed,
+                )
                 if parameter_end is not None:
                     output.append("$PARAM")
                     dynamic = True
                     cursor = parameter_end
+                    if inherited_quote_closed[0]:
+                        quote = None
+                        ansi_c_quote = False
                     continue
             elif quote == '"' and character == "`":
-                substitution_end = _skip_backtick_substitution(content, cursor, limit)
+                substitution_end = _skip_backtick_substitution(
+                    content,
+                    cursor,
+                    limit,
+                    end_cache=backtick_end_cache,
+                    parameter_end_cache=parameter_end_cache,
+                    substitution_end_cache=substitution_end_cache,
+                )
                 if substitution_end is None:
                     return None
                 static_value = _static_printf_substitution(
@@ -627,6 +1252,9 @@ def _parse_shell_command_word(content: str, start: int) -> _ShellCommandWord | N
                 if escaped == "\n":
                     cursor += 2
                     continue
+                if escaped == "\r" and cursor + 2 < limit and content[cursor + 2] == "\n":
+                    cursor += 3
+                    continue
                 if escaped in '$`"\\':
                     output.append(escaped)
                 else:
@@ -641,7 +1269,14 @@ def _parse_shell_command_word(content: str, start: int) -> _ShellCommandWord | N
             cursor += 2
             continue
         elif character == "$" and cursor + 1 < limit and content[cursor + 1] == "(":
-            substitution_end = _skip_command_substitution(content, cursor, limit)
+            substitution_end = _skip_command_substitution(
+                content,
+                cursor,
+                limit,
+                end_cache=substitution_end_cache,
+                parameter_end_cache=parameter_end_cache,
+                backtick_end_cache=backtick_end_cache,
+            )
             if substitution_end is None:
                 return None
             static_value = _static_printf_substitution(content, cursor, substitution_end)
@@ -658,7 +1293,14 @@ def _parse_shell_command_word(content: str, start: int) -> _ShellCommandWord | N
             cursor = substitution_end
             continue
         elif character == "$":
-            parameter_end = _skip_parameter_expansion(content, cursor, limit)
+            parameter_end = _skip_parameter_expansion(
+                content,
+                cursor,
+                limit,
+                end_cache=parameter_end_cache,
+                substitution_end_cache=substitution_end_cache,
+                backtick_end_cache=backtick_end_cache,
+            )
             if parameter_end is not None:
                 if _is_ifs_expansion(content, cursor, parameter_end):
                     cursor = parameter_end
@@ -668,7 +1310,14 @@ def _parse_shell_command_word(content: str, start: int) -> _ShellCommandWord | N
                 cursor = parameter_end
                 continue
         elif character == "`":
-            substitution_end = _skip_backtick_substitution(content, cursor, limit)
+            substitution_end = _skip_backtick_substitution(
+                content,
+                cursor,
+                limit,
+                end_cache=backtick_end_cache,
+                parameter_end_cache=parameter_end_cache,
+                substitution_end_cache=substitution_end_cache,
+            )
             if substitution_end is None:
                 return None
             static_value = _static_printf_substitution(
@@ -696,6 +1345,9 @@ def _parse_shell_command_word(content: str, start: int) -> _ShellCommandWord | N
             if content[cursor + 1] == "\n":
                 cursor += 2
                 continue
+            if content[cursor + 1] == "\r" and cursor + 2 < limit and content[cursor + 2] == "\n":
+                cursor += 3
+                continue
             cursor += 1
             output.append(content[cursor])
         elif character.isspace() or character in ";|&()<>":
@@ -710,19 +1362,58 @@ def _parse_shell_command_word(content: str, start: int) -> _ShellCommandWord | N
     return _ShellCommandWord("".join(output), cursor, dynamic, limited)
 
 
-def _rm_command_words(content: str) -> Iterator[tuple[int, int]]:
+def _destructive_command_words(content: str) -> Iterator[tuple[int, int]]:
     parsed_through = 0
+    parameter_end_cache: dict[int, _ParameterExpansionEnd] = {}
+    substitution_end_cache: dict[int, int | None] = {}
+    backtick_end_cache: dict[int, int | None] = {}
     for candidate in _SHELL_COMMAND_WORD_START_RE.finditer(content):
         start = candidate.start()
         if start < parsed_through:
             continue
         if not _is_shell_command_word_start(content, start):
             continue
-        parsed = _parse_shell_command_word(content, start)
+        if _has_quoted_assignment_prefix(content, start):
+            # This candidate cannot name a destructive command. Nested command
+            # substitutions remain independent candidates in the outer scan.
+            continue
+        if content.startswith("$(", start):
+            substitution_end = _bounded_static_substitution_end(content, start)
+            if substitution_end is None or not _is_printf_substitution(
+                content,
+                start,
+                substitution_end,
+            ):
+                # Dynamic substitutions cannot deterministically name a
+                # destructive command. Their inner literal commands remain
+                # independent candidates; the bounded structural check avoids
+                # reparsing nested suffixes quadratically.
+                continue
+        parsed = _parse_shell_command_word(
+            content,
+            start,
+            parameter_end_cache,
+            substitution_end_cache,
+            backtick_end_cache,
+        )
         if parsed is None:
             continue
+        # A long concatenated quoted word can expose every closing quote as a
+        # regex candidate. Skip the rest only when it cannot be an executed
+        # whitespace-bearing wrapper or a dynamic substitution wrapper.
+        candidate_character = content[start]
+        if (
+            candidate_character in "'\""
+            and not parsed.dynamic
+            and not any(character.isspace() for character in parsed.text)
+        ):
+            parsed_through = max(parsed_through, parsed.end)
         command_basename = parsed.text.casefold().rsplit("/", 1)[-1]
-        if not parsed.dynamic and not parsed.limited and command_basename == "rm":
+        if (
+            not parsed.dynamic
+            and not parsed.limited
+            and command_basename in _DESTRUCTIVE_COMMAND_BASENAMES
+        ):
             parsed_through = max(parsed_through, parsed.end)
             yield start, parsed.end
 
@@ -733,12 +1424,42 @@ def _has_shell_command_word_exhaustion(
 ) -> bool:
     """Find candidate command words whose deterministic parse hit a safety bound."""
     parsed_through = 0
+    parameter_end_cache: dict[int, _ParameterExpansionEnd] = {}
+    substitution_end_cache: dict[int, int | None] = {}
+    backtick_end_cache: dict[int, int | None] = {}
     for candidate in _SHELL_COMMAND_WORD_START_RE.finditer(content):
         check_runtime()
         start = candidate.start()
         if start < parsed_through or not _is_shell_command_word_start(content, start):
             continue
-        parsed = _parse_shell_command_word(content, start)
+        if _has_quoted_assignment_prefix(content, start):
+            continue
+        if content.startswith("$(", start):
+            substitution_end = _bounded_static_substitution_end(content, start)
+            if substitution_end is None:
+                if _has_printf_invocation_prefix(
+                    content,
+                    start,
+                    check_runtime,
+                    parameter_end_cache,
+                    substitution_end_cache,
+                    backtick_end_cache,
+                ):
+                    return True
+                continue
+            if not _is_printf_substitution(
+                content,
+                start,
+                substitution_end,
+            ):
+                continue
+        parsed = _parse_shell_command_word(
+            content,
+            start,
+            parameter_end_cache,
+            substitution_end_cache,
+            backtick_end_cache,
+        )
         if parsed is None:
             continue
         parsed_through = max(parsed_through, parsed.end)
@@ -758,32 +1479,37 @@ def _command_wrapper_quote(content: str, command_start: int) -> str | None:
     return content[command_start - 1] if backslashes % 2 == 0 else None
 
 
-def _skip_command_substitution(content: str, start: int, limit: int) -> int | None:
-    depth = 1
-    quote: str | None = None
-    cursor = start + 2
-    while cursor < limit:
-        character = content[cursor]
-        if quote is not None:
-            if character == quote:
-                quote = None
-            elif character == "\\" and quote != "'" and cursor + 1 < limit:
-                cursor += 1
-        elif character in "'\"`":
-            quote = character
-        elif character == "\\" and cursor + 1 < limit:
-            cursor += 1
-        elif character == "$" and cursor + 1 < limit and content[cursor + 1] == "(":
-            depth += 1
-            cursor += 1
-        elif character == "(":
-            depth += 1
-        elif character == ")":
-            depth -= 1
-            if depth == 0:
-                return cursor + 1
-        cursor += 1
-    return None
+def _skip_command_substitution(
+    content: str,
+    start: int,
+    limit: int,
+    check_runtime: Callable[[], None] | None = None,
+    end_cache: dict[int, int | None] | None = None,
+    parameter_end_cache: dict[int, _ParameterExpansionEnd] | None = None,
+    backtick_end_cache: dict[int, int | None] | None = None,
+) -> int | None:
+    if end_cache is not None and start in end_cache:
+        return end_cache[start]
+    return _skip_shell_delimited_expansion(
+        content,
+        start,
+        limit,
+        "command",
+        check_runtime,
+        parameter_end_cache,
+        end_cache,
+        backtick_end_cache,
+    )
+
+
+def _bounded_static_substitution_end(content: str, start: int) -> int | None:
+    """Return a structurally valid ``$()`` close within the static evaluator bound."""
+    inner_start = start + 2
+    scan_limit = min(len(content), inner_start + _PRINTF_STATIC_CHARS + 1)
+    end = _skip_command_substitution(content, start, scan_limit)
+    if end is None or end - 1 - inner_start > _PRINTF_STATIC_CHARS:
+        return None
+    return end
 
 
 def _bounded_shell_tokens(
@@ -803,6 +1529,8 @@ def _bounded_shell_tokens(
     current_unquoted_brace_open = False
     current_unquoted_brace_close = False
     current_unquoted_brace_comma = False
+    current_leading_tilde_unquoted = False
+    source_word_has_content = False
     expect_redirection_target = False
     quote: str | None = None
     ansi_c_quote = False
@@ -820,9 +1548,10 @@ def _bounded_shell_tokens(
             expect_redirection_target = False
 
     def mark_quoted_word() -> None:
-        nonlocal current_has_quoted_content
+        nonlocal current_has_quoted_content, source_word_has_content
         start_word()
         current_has_quoted_content = True
+        source_word_has_content = True
 
     def append_piece(
         piece: str,
@@ -838,7 +1567,9 @@ def _bounded_shell_tokens(
         nonlocal current_unquoted_brace_open
         nonlocal current_unquoted_brace_close
         nonlocal current_unquoted_brace_comma
+        nonlocal source_word_has_content
         start_word()
+        source_word_has_content = True
         current.append(piece)
         current_glob_projection.append(
             piece
@@ -864,6 +1595,7 @@ def _bounded_shell_tokens(
         nonlocal current_unquoted_brace_open
         nonlocal current_unquoted_brace_close
         nonlocal current_unquoted_brace_comma
+        nonlocal current_leading_tilde_unquoted
         if word_started:
             if complete and current_is_argument:
                 tokens.append(
@@ -875,6 +1607,7 @@ def _bounded_shell_tokens(
                         current_unquoted_brace_open
                         and current_unquoted_brace_close
                         and current_unquoted_brace_comma,
+                        current_leading_tilde_unquoted,
                     )
                 )
             current.clear()
@@ -886,6 +1619,7 @@ def _bounded_shell_tokens(
             current_unquoted_brace_open = False
             current_unquoted_brace_close = False
             current_unquoted_brace_comma = False
+            current_leading_tilde_unquoted = False
 
     while cursor < limit:
         character = content[cursor]
@@ -904,6 +1638,7 @@ def _bounded_shell_tokens(
                 append_piece(decoded, quoted=True)
                 continue
             elif quote == '"' and character == "$" and cursor + 1 < limit:
+                inherited_quote_closed = [False]
                 if content[cursor + 1] == "(":
                     substitution_end = _skip_command_substitution(content, cursor, limit)
                     if substitution_end is None:
@@ -924,7 +1659,13 @@ def _bounded_shell_tokens(
                     )
                     cursor = substitution_end
                     continue
-                parameter_end = _skip_parameter_expansion(content, cursor, limit)
+                parameter_end = _skip_parameter_expansion(
+                    content,
+                    cursor,
+                    limit,
+                    inherited_double_quote=True,
+                    inherited_quote_closed=inherited_quote_closed,
+                )
                 if parameter_end is not None:
                     append_piece(
                         "$DYNAMIC",
@@ -932,6 +1673,9 @@ def _bounded_shell_tokens(
                         quoted=True,
                     )
                     cursor = parameter_end
+                    if inherited_quote_closed[0]:
+                        quote = None
+                        ansi_c_quote = False
                     continue
             elif quote == '"' and character == "`":
                 substitution_end = _skip_backtick_substitution(content, cursor, limit)
@@ -963,6 +1707,9 @@ def _bounded_shell_tokens(
                 escaped = content[cursor + 1]
                 if escaped == "\n":
                     cursor += 2
+                    continue
+                if escaped == "\r" and cursor + 2 < limit and content[cursor + 2] == "\n":
+                    cursor += 3
                     continue
                 if escaped in '$`"\\':
                     append_piece(escaped, quoted=True)
@@ -1035,6 +1782,7 @@ def _bounded_shell_tokens(
             parameter_end = _skip_parameter_expansion(content, cursor, limit)
             if parameter_end is not None:
                 if _is_ifs_expansion(content, cursor, parameter_end):
+                    source_word_has_content = True
                     flush()
                 else:
                     append_piece("$DYNAMIC", dynamic_can_be_empty=True)
@@ -1057,6 +1805,9 @@ def _bounded_shell_tokens(
             if content[cursor + 1] == "\n":
                 cursor += 2
                 continue
+            if content[cursor + 1] == "\r" and cursor + 2 < limit and content[cursor + 2] == "\n":
+                cursor += 3
+                continue
             append_piece(content[cursor + 1])
             cursor += 1
         elif character == "\n":
@@ -1064,10 +1815,12 @@ def _bounded_shell_tokens(
             return tuple(tokens), cursor, parse_limited
         elif character.isspace():
             flush()
+            source_word_has_content = False
         elif character == "#" and not word_started:
             return tuple(tokens), cursor, parse_limited
         elif character in "<>":
             flush()
+            source_word_has_content = False
             expect_redirection_target = True
             if cursor + 1 < limit and content[cursor + 1] == character:
                 cursor += 1
@@ -1084,6 +1837,7 @@ def _bounded_shell_tokens(
             continue
         elif character == "&" and cursor + 1 < limit and content[cursor + 1] == ">":
             flush()
+            source_word_has_content = False
             expect_redirection_target = True
             cursor += 1
             if cursor + 1 < limit and content[cursor + 1] == ">":
@@ -1092,6 +1846,8 @@ def _bounded_shell_tokens(
             flush()
             return tuple(tokens), cursor, parse_limited
         else:
+            if not source_word_has_content and character == "~":
+                current_leading_tilde_unquoted = True
             append_piece(
                 character,
                 unquoted=character in "*?",
@@ -1115,7 +1871,11 @@ def _bounded_shell_tokens(
     return tuple(tokens), limit, not complete or parse_limited
 
 
-def _is_root_glob_documentation(content: str, command_start: int) -> bool:
+def _is_root_glob_documentation(
+    content: str,
+    command_start: int,
+    body_start: int,
+) -> bool:
     """Return whether ``rm`` is the noun in a bounded prose description."""
     context_start = max(0, command_start - 256)
     previous_boundary = max(
@@ -1140,7 +1900,7 @@ def _is_root_glob_documentation(content: str, command_start: int) -> bool:
 
     relative_start = command_start - clause_start
     prefix = clause[:relative_start]
-    suffix = clause[relative_start + 2 :]
+    suffix = clause[max(relative_start, body_start - clause_start) :]
     if not prefix.strip() or prefix_truncated:
         return False
     execution = _ROOT_GLOB_EXECUTION_PREFIX_RE.search(prefix)
@@ -1279,6 +2039,15 @@ def _has_destructive_root_glob(tokens: tuple[_ShellToken, ...]) -> bool:
     return any(is_root_glob(token) for token in tokens) and _has_recursive_force_options(tokens)
 
 
+def _has_destructive_root_path(tokens: tuple[_ShellToken, ...]) -> bool:
+    """Return whether recursive-force options target root or home expansion."""
+    has_root_path = any(
+        token.text.startswith("/") or token.text.startswith("~") and token.leading_tilde_unquoted
+        for token in tokens
+    )
+    return has_root_path and _has_recursive_force_options(tokens)
+
+
 def _has_unsupported_brace_expansion(tokens: tuple[_ShellToken, ...]) -> bool:
     return any(
         token.brace_expansion and _static_brace_expansions(token.text) is None for token in tokens
@@ -1294,13 +2063,18 @@ def _tm1_candidates(
 
     seen_commands: set[tuple[int, int]] = set()
     covered_until = 0
-    for command_start, body_start in _rm_command_words(content):
+    for command_start, body_start in _destructive_command_words(content):
         if command_start < covered_until:
             continue
         command_key = (command_start, body_start)
         if command_key in seen_commands:
             continue
         seen_commands.add(command_key)
+        # Documentation is excluded regardless of the shell parse result.  Apply
+        # that existing semantic gate first so large manuals do not pay for a
+        # character-by-character shell parse for every explanatory ``rm`` noun.
+        if _is_root_glob_documentation(content, command_start, body_start):
+            continue
         tokens, command_end, _ = _bounded_shell_tokens(
             content,
             command_start,
@@ -1308,9 +2082,7 @@ def _tm1_candidates(
         )
         covered_until = max(covered_until, command_end)
         command = content[command_start:command_end]
-        if _is_root_glob_documentation(content, command_start):
-            continue
-        if _has_destructive_root_glob(tokens):
+        if _has_destructive_root_glob(tokens) or _has_destructive_root_path(tokens):
             yield command_start, command_end, command, 0.9
 
 
@@ -1322,9 +2094,14 @@ def has_bounded_parse_exhaustion(
     if _has_shell_command_word_exhaustion(content, check_runtime):
         return True
     covered_until = 0
-    for command_start, body_start in _rm_command_words(content):
+    for command_start, body_start in _destructive_command_words(content):
         check_runtime()
         if command_start < covered_until:
+            continue
+        # A recognized prose description cannot contribute parse exhaustion:
+        # the same predicate below would discard it after parsing.  Short-circuit
+        # it here to keep bounded-runtime accounting linear for documentation.
+        if _is_root_glob_documentation(content, command_start, body_start):
             continue
         tokens, command_end, exhausted = _bounded_shell_tokens(
             content,
@@ -1332,9 +2109,7 @@ def has_bounded_parse_exhaustion(
             body_start,
         )
         covered_until = max(covered_until, command_end)
-        if (
-            exhausted or _has_unsupported_brace_expansion(tokens)
-        ) and not _is_root_glob_documentation(content, command_start):
+        if exhausted or _has_unsupported_brace_expansion(tokens):
             return True
     return False
 

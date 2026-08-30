@@ -7,7 +7,9 @@ from __future__ import annotations
 
 import json
 import re
+import sys
 import time
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -29,6 +31,11 @@ from skillspector.security_reconstruction import (
 def _findings(content: str, *modules: object) -> list[Finding]:
     state = {"components": ["SKILL.md"], "file_cache": {"SKILL.md": content}}
     return static_runner.run_static_patterns(state, list(modules))
+
+
+def _shell_stress_deadline() -> float:
+    """Allow branch-coverage tracing overhead without weakening normal runs."""
+    return 12.0 if sys.gettrace() is not None else 2.0
 
 
 class _RecordingToolMisuseModule:
@@ -926,6 +933,11 @@ def test_forward_reference_keeps_left_context_at_window_owner_boundary() -> None
         pytest.param("(rm -rf *)", True, id="subshell"),
         pytest.param("rm -rf $(echo foo) *", True, id="substitution-before-star"),
         pytest.param("rm $(echo foo) -rf *", True, id="substitution-before-flags"),
+        pytest.param(
+            "rm $(echo harmless # )\n) -rf *",
+            True,
+            id="commented-close-inside-substitution",
+        ),
         pytest.param("rm -rf $((1)) *", True, id="arithmetic-substitution-before-star"),
         pytest.param("rm -rf <(echo foo) *", True, id="process-input-before-star"),
         pytest.param("rm >(echo foo) -rf *", True, id="process-output-before-flags"),
@@ -973,6 +985,22 @@ def test_forward_reference_keeps_left_context_at_window_owner_boundary() -> None
         pytest.param("rm -r$(printf f) *", True, id="dynamic-option-suffix"),
         pytest.param("rm ${x:--rf} *", False, id="uncertain-dynamic-option-token"),
         pytest.param("$(printf rm) -rf *", True, id="dynamic-command-word"),
+        pytest.param("$($'printf' rm) -rf /", True, id="ansi-c-quoted-printf-command"),
+        pytest.param(
+            "$(p$'rintf' rm) -rf /",
+            True,
+            id="ansi-c-fragmented-printf-command",
+        ),
+        pytest.param(
+            "$(e$'nv' printf rm) -rf /",
+            True,
+            id="ansi-c-fragmented-env-wrapper",
+        ),
+        pytest.param(
+            '$(p$"rintf" rm) -rf /',
+            True,
+            id="locale-fragmented-printf-command",
+        ),
         pytest.param('"$RM" -rf *', False, id="unknown-dynamic-command-word"),
         pytest.param("rm -rf *$EMPTY", True, id="dynamic-root-glob-suffix"),
         pytest.param('rm -rf "$prefix"*', True, id="dynamic-quoted-prefix-root-glob"),
@@ -1069,6 +1097,11 @@ def test_forward_reference_keeps_left_context_at_window_owner_boundary() -> None
             id="command-wrapped-printf",
         ),
         pytest.param(
+            "$(command -p -p -- printf rm) -rf /",
+            True,
+            id="command-options-before-terminator",
+        ),
+        pytest.param(
             "$(builtin printf %s%s r m) -rf *",
             True,
             id="builtin-wrapped-printf",
@@ -1131,6 +1164,21 @@ def test_forward_reference_keeps_left_context_at_window_owner_boundary() -> None
             "$(command -v printf) -rf *",
             False,
             id="command-query-does-not-execute-printf",
+        ),
+        pytest.param(
+            "$(command -- -- printf rm) -rf /",
+            False,
+            id="command-option-terminator-is-not-repeatable",
+        ),
+        pytest.param(
+            "$(command -- -p printf rm) -rf /",
+            False,
+            id="command-option-after-terminator-is-command-name",
+        ),
+        pytest.param(
+            "$(echo $'printf' rm) -rf /",
+            False,
+            id="ansi-c-printf-argument-is-not-command",
         ),
         pytest.param(
             "The rm utility accepts -r and -f while * denotes a wildcard.",
@@ -1356,6 +1404,63 @@ def test_tm1_root_glob_scans_large_horizontal_gap_without_widening_glob(
     assert any(finding.rule_id == "TM1" for finding in findings) is detected
 
 
+@pytest.mark.parametrize(
+    ("content", "detected"),
+    [
+        pytest.param("rm \\\n-rf /", True, id="continued-options"),
+        pytest.param("rm \\\r\n-rf /", True, id="crlf-continued-options"),
+        pytest.param("rm -rf \\\n/", True, id="continued-root-path"),
+        pytest.param(r"rm \-rf /", True, id="escaped-option-hyphen"),
+        pytest.param(r"rm harmless\;still -rf /", True, id="escaped-semicolon"),
+        pytest.param(r"rm harmless\&still -rf /", True, id="escaped-ampersand"),
+        pytest.param(r"rm harmless\|still -rf /", True, id="escaped-pipe"),
+        pytest.param("rm 'harmless;still' -rf /", True, id="single-quoted-semicolon"),
+        pytest.param("rm 'harmless&still' -rf /", True, id="single-quoted-ampersand"),
+        pytest.param("rm 'harmless|still' -rf /", True, id="single-quoted-pipe"),
+        pytest.param("rm 'harmless\nstill' -rf /", True, id="single-quoted-newline"),
+        pytest.param('rm "harmless;still" -rf /', True, id="double-quoted-semicolon"),
+        pytest.param('rm "harmless&still" -rf /', True, id="double-quoted-ampersand"),
+        pytest.param('rm "harmless|still" -rf /', True, id="double-quoted-pipe"),
+        pytest.param('rm "harmless\nstill" -rf /', True, id="double-quoted-newline"),
+        pytest.param("rm 'harmless;still' -rf ~", True, id="quoted-separator-home-root"),
+        pytest.param(
+            "rm 'harmless;still' -rf ~/scratch",
+            True,
+            id="quoted-separator-home-subpath",
+        ),
+        pytest.param("del 'harmless;still' -rf /", True, id="quoted-separator-del"),
+        pytest.param("erase 'harmless;still' -rf /", True, id="quoted-separator-erase"),
+        pytest.param(r"rm $(echo foo\;# ) -rf /", True, id="escaped-semicolon-before-hash"),
+        pytest.param(r"rm $(echo foo\|# ) -rf /", True, id="escaped-pipe-before-hash"),
+        pytest.param(r"rm $(echo foo\&# ) -rf /", True, id="escaped-ampersand-before-hash"),
+        pytest.param(
+            "rm $(echo harmless # )\n) -rf /",
+            True,
+            id="commented-close-in-substitution",
+        ),
+        pytest.param("r\\\r\nm -rf /", True, id="crlf-continued-command-word"),
+        pytest.param('rm -rf "~"', False, id="quoted-home-literal"),
+        pytest.param("rm -rf '~'", False, id="single-quoted-home-literal"),
+        pytest.param(r"rm -rf \~", False, id="escaped-home-literal"),
+        pytest.param("rm -rf $'~'", False, id="ansi-c-quoted-home-literal"),
+        pytest.param("rm -rf $IFS~", False, id="ifs-before-home-literal"),
+        pytest.param("rm -rf ${IFS}~", False, id="braced-ifs-before-home-literal"),
+        pytest.param("rm harmless\necho -rf /", False, id="newline-boundary"),
+        pytest.param("rm harmless; echo -rf /", False, id="semicolon-boundary"),
+        pytest.param("rm harmless | echo -rf /", False, id="pipe-boundary"),
+        pytest.param("rm harmless && echo -rf /", False, id="and-boundary"),
+        pytest.param("rm\\\n-rf /", False, id="continued-command-name"),
+    ],
+)
+def test_tm1_root_path_scan_respects_shell_boundaries(
+    content: str,
+    detected: bool,
+) -> None:
+    findings = tm_module.analyze(content, "cleanup.sh", "shell")
+
+    assert any(finding.rule_id == "TM1" for finding in findings) is detected
+
+
 def test_repeated_root_glob_documentation_is_linear_and_clean() -> None:
     content = "The rm command accepts -r and -f while * denotes a wildcard; " * 2_000
 
@@ -1365,6 +1470,77 @@ def test_repeated_root_glob_documentation_is_linear_and_clean() -> None:
 
     assert findings == []
     assert elapsed < 2.0
+
+
+def test_nested_dynamic_substitutions_do_not_reparse_each_suffix(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = 0
+    original = tm_module._parse_shell_command_word
+
+    def counted(
+        content: str,
+        start: int,
+        *caches: dict[int, int | None] | None,
+    ) -> tm_module._ShellCommandWord | None:
+        nonlocal calls
+        calls += 1
+        return original(content, start, *caches)
+
+    monkeypatch.setattr(tm_module, "_parse_shell_command_word", counted)
+    content = "$(" * 2_000 + "x" + ")" * 2_000
+
+    findings = tm_module.analyze(content, "nested.sh", "shell")
+
+    assert findings == []
+    # Only the constant-size tail inside the static evaluator window is parsed;
+    # the attacker-controlled nested prefix is never reparsed per candidate.
+    assert calls < 100
+
+
+@pytest.mark.parametrize(
+    "prefix",
+    ["$(printf ')' ", "$(printf # )\n", "$(printf \\) "],
+)
+def test_nested_printf_fake_closes_do_not_reparse_each_suffix(
+    monkeypatch: pytest.MonkeyPatch,
+    prefix: str,
+) -> None:
+    calls = 0
+    original = tm_module._parse_shell_command_word
+
+    def counted(
+        content: str,
+        start: int,
+        *caches: dict[int, int | None] | None,
+    ) -> tm_module._ShellCommandWord | None:
+        nonlocal calls
+        calls += 1
+        return original(content, start, *caches)
+
+    monkeypatch.setattr(tm_module, "_parse_shell_command_word", counted)
+    content = prefix * 2_000 + "x" + ")" * 2_000
+
+    started_at = time.perf_counter()
+    findings = tm_module.analyze(content, "nested.sh", "shell")
+    elapsed = time.perf_counter() - started_at
+
+    assert findings == []
+    # Quote candidates are still inspected once, but no candidate may rescan
+    # the attacker-controlled nested suffix.
+    assert calls < 2_100
+    assert elapsed < _shell_stress_deadline()
+
+
+def test_root_glob_documentation_does_not_mask_later_destructive_command() -> None:
+    content = (
+        "The rm command accepts -r and -f while * denotes a wildcard, "
+        "whereas rm -rf * is destructive;"
+    )
+
+    findings = tm_module.analyze(content, "README.md", "markdown")
+
+    assert any(finding.rule_id == "TM1" for finding in findings)
 
 
 def test_repeated_root_glob_documentation_stays_clean_across_static_windows() -> None:
@@ -1442,7 +1618,10 @@ def test_shell_command_word_cap_exhaustion_is_partial() -> None:
     assert event["reason_code"] is LedgerReason.STATIC_PARSE_LIMIT
 
 
-@pytest.mark.parametrize("printf_command", ["printf", 'p"rintf"', "env printf"])
+@pytest.mark.parametrize(
+    "printf_command",
+    ["printf", 'p"rintf"', "p'rintf'", '"pri"ntf', r"p\rintf", "env printf"],
+)
 def test_unsupported_printf_argument_bound_is_partial(printf_command: str) -> None:
     values = " ".join(["''"] * (tm_module._PRINTF_STATIC_ARGUMENTS + 1) + ["r", "m"])
     state = {
@@ -1456,6 +1635,170 @@ def test_unsupported_printf_argument_bound_is_partial(printf_command: str) -> No
     event = result["inspection_ledger"][0]
     assert event["outcome"] is LedgerOutcome.PARTIAL
     assert event["reason_code"] is LedgerReason.STATIC_PARSE_LIMIT
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "$(printf rm " + " " * 300 + ") -rf *",
+        "$(" + " " * 300 + "printf rm) -rf *",
+        "$(p" + "''" * 200 + "rintf rm) -rf *",
+        "$(\nprintf rm\n) -rf *",
+        "$(\r\nprintf rm\r\n) -rf *",
+        "$(printf rm '()') -rf *",
+        '$(printf rm "$((1))") -rf *',
+        "$(env --weird printf rm" + " " * 300 + ") -rf *",
+        "$(env -u" + " " * 300 + ") -rf *",
+        "$(env X=$" + "A" * 280 + " printf rm) -rf *",
+        '$(env X="$' + "A" * 280 + '" printf rm) -rf *',
+        "$(env X=$(echo) Y=" + "A" * 280 + " printf rm) -rf *",
+        '$(env X="$(echo)" Y=' + "A" * 280 + " printf rm) -rf *",
+        "$(env X=$((1)) Y=" + "A" * 280 + " printf rm) -rf *",
+        '$(env X="$((1))" Y=' + "A" * 280 + " printf rm) -rf *",
+        "$(env X=`echo` Y=" + "A" * 280 + " printf rm) -rf *",
+        '$(env X="`echo`" Y=' + "A" * 280 + " printf rm) -rf *",
+        "$(env X=$'abc' Y=" + "A" * 280 + " printf rm) -rf *",
+        "$(env X=$'a\\'b' Y=" + "A" * 280 + " printf rm) -rf *",
+        "$(env X=$'a\\nb' Y=" + "A" * 280 + " printf rm) -rf *",
+        "$(env X='a\nb' Y=" + "A" * 280 + " printf rm) -rf *",
+        '$(env X="a\nb" Y=' + "A" * 280 + " printf rm) -rf *",
+        '$(env X=$"abc" Y=' + "A" * 280 + " printf rm) -rf *",
+        "$(env X=<(echo) Y=" + "A" * 280 + " printf rm) -rf *",
+        "$(env X=>(echo) Y=" + "A" * 280 + " printf rm) -rf *",
+        "$($(printf printf" + " " * 300 + ") rm) -rf *",
+        "$(env env env env printf rm) -rf /",
+        "$(env env env env echo printf) -rf /",
+        "$(env X=${x:-'}'} Y=" + "A" * 280 + " printf rm) -rf *",
+        '$(env X=${x:-"}"} Y=' + "A" * 280 + " printf rm) -rf *",
+        "$(env X=${x:-$(echo })} Y=" + "A" * 280 + " printf rm) -rf *",
+        "$(env X=${x:-`echo }`} Y=" + "A" * 280 + " printf rm) -rf *",
+        "$(env X=${x:-)} Y=" + "A" * 280 + " printf rm) -rf /",
+        "$(env \"X=${x:-$'}'\" Y=" + "A" * 280 + ' printf %.0srm "}") -rf /',
+        '$(env "X=${x:-$"} Y=A printf %.0srm "}") -rf /',
+        '$(env "X=${x:-$"} Y=' + "A" * 280 + ' printf %.0srm "}") -rf /',
+        "$($(printf printf) rm) -rf /",
+        "$(p$(printf rintf) rm) -rf /",
+        "$(e$(printf nv) printf rm) -rf /",
+        "$(env $(printf printf) rm) -rf /",
+        "$($(printf printf) echo) -rf /",
+    ],
+)
+def test_unsupported_printf_substitution_shape_is_partial(content: str) -> None:
+    state = {"components": ["SKILL.md"], "file_cache": {"SKILL.md": content}}
+
+    result = static_runner.run_static_patterns_with_ledger(state, [tm_module])
+
+    assert not any(finding.rule_id == "TM1" for finding in result["findings"])
+    event = result["inspection_ledger"][0]
+    assert event["outcome"] is LedgerOutcome.PARTIAL
+    assert event["reason_code"] is LedgerReason.STATIC_PARSE_LIMIT
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "$(echo printf " + " " * 300 + ") -rf *",
+        "$(env X=$" + "A" * 280 + " echo printf) -rf *",
+        '$(env X="$' + "A" * 280 + '" echo printf) -rf *',
+        "$(env X=$(echo) Y=" + "A" * 280 + " echo printf) -rf *",
+        '$(env X="`echo`" Y=' + "A" * 280 + " echo printf) -rf *",
+        "$(env X=$'a\\'b' Y=" + "A" * 280 + " echo printf) -rf *",
+        "$(env X=$'a\\nb' Y=" + "A" * 280 + " echo printf) -rf *",
+        "$(env X='a\nb' Y=" + "A" * 280 + " echo printf) -rf *",
+        '$(env X="a\nb" Y=' + "A" * 280 + " echo printf) -rf *",
+        "$(env X=${x:-'}'} Y=" + "A" * 280 + " echo printf) -rf *",
+        '$(env X=${x:-"}"} Y=' + "A" * 280 + " echo printf) -rf *",
+        "$(env X=${x:-$(echo })} Y=" + "A" * 280 + " echo printf) -rf *",
+        "$(env X=${x:-`echo }`} Y=" + "A" * 280 + " echo printf) -rf *",
+        "$(env X=${x:-)} Y=" + "A" * 280 + " echo printf) -rf /",
+        "$(env \"X=${x:-$'}'\" Y=" + "A" * 280 + ' echo printf "}") -rf /',
+        '$(env "X=${x:-$"} Y=A echo printf "}") -rf /',
+        '$(env "X=${x:-$"} Y=' + "A" * 280 + ' echo printf "}") -rf /',
+    ],
+)
+def test_long_non_invocation_printf_mention_is_not_partial(content: str) -> None:
+    state = {"components": ["SKILL.md"], "file_cache": {"SKILL.md": content}}
+
+    result = static_runner.run_static_patterns_with_ledger(state, [tm_module])
+
+    assert result["findings"] == []
+    assert result["inspection_ledger"][0]["outcome"] is LedgerOutcome.COMPLETED
+
+
+def test_nested_env_parameter_assignments_are_scanned_linearly(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = 0
+    original = tm_module._skip_parameter_expansion
+
+    def counted(
+        content: str,
+        start: int,
+        limit: int,
+        check_runtime: Callable[[], None] | None = None,
+        end_cache: dict[int, tm_module._ParameterExpansionEnd] | None = None,
+        substitution_end_cache: dict[int, int | None] | None = None,
+        backtick_end_cache: dict[int, int | None] | None = None,
+        inherited_double_quote: bool = False,
+        inherited_quote_closed: list[bool] | None = None,
+    ) -> int | None:
+        nonlocal calls
+        calls += 1
+        return original(
+            content,
+            start,
+            limit,
+            check_runtime,
+            end_cache,
+            substitution_end_cache,
+            backtick_end_cache,
+            inherited_double_quote,
+            inherited_quote_closed,
+        )
+
+    monkeypatch.setattr(tm_module, "_skip_parameter_expansion", counted)
+    repetitions = 2_000
+    content = '$(env "X=${x:- ' * repetitions + "A" + '}" echo printf)' * repetitions + " -rf *"
+
+    started_at = time.perf_counter()
+    exhausted = tm_module.has_bounded_parse_exhaustion(content, lambda: None)
+    elapsed = time.perf_counter() - started_at
+
+    assert exhausted is False
+    assert calls <= repetitions + 10
+    assert elapsed < _shell_stress_deadline()
+
+
+def test_unterminated_nested_substitution_comments_are_scanned_linearly() -> None:
+    repetitions = 2_000
+    content = "$(env X=x $(echo " * repetitions + "# no newline" + ")" * repetitions
+
+    started_at = time.perf_counter()
+    exhausted = tm_module.has_bounded_parse_exhaustion(content, lambda: None)
+    elapsed = time.perf_counter() - started_at
+
+    assert exhausted is True
+    assert elapsed < 2.0
+
+
+def test_alternating_parameter_and_command_substitutions_are_scanned_linearly() -> None:
+    repetitions = 4_000
+    content = (
+        "$(env X="
+        + "${x:-$(echo " * repetitions
+        + "z"
+        + ")}" * repetitions
+        + " Y="
+        + "A" * 280
+        + " echo printf) -rf /"
+    )
+
+    started_at = time.perf_counter()
+    exhausted = tm_module.has_bounded_parse_exhaustion(content, lambda: None)
+    elapsed = time.perf_counter() - started_at
+
+    assert exhausted is False
+    assert elapsed < 2.0
 
 
 @pytest.mark.parametrize("terminator", ["\n", ";", "# comment\n"])

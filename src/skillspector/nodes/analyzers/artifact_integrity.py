@@ -16,6 +16,7 @@ from skillspector.artifacts import (
     ContentKind,
     _concealed_instruction_run_spans,
     _contextual_default_ignorable_boundary_spans,
+    _obfuscated_instruction_matches,
 )
 from skillspector.inspection_ledger import (
     InspectionLedgerEvent,
@@ -34,6 +35,7 @@ from skillspector.state import (
 )
 from skillspector.unicode_confusables import ASCII_CONFUSABLE_SKELETON
 
+from .common import LINE_BREAK_CHARS, LOGICAL_LINE_BREAK, get_line_number
 from .static_runner import MAX_FINDINGS_PER_ANALYZER, MAX_FINDINGS_PER_ARTIFACT
 
 ANALYZER_ID = "artifact_integrity"
@@ -264,6 +266,19 @@ _LETTER_SPACING_SECURITY_SUFFIXES = (
     "now",
 )
 _MAX_LETTER_SPACING_SECURITY_CONNECTORS = 3
+_MAX_BENIGN_NOTATION_RUN_CHARS = 96
+_BENIGN_NOTATION_SECURITY_TERMS = frozenset({"bypass", "restrictions"})
+_BENIGN_STANDALONE_BYPASS_SUM = re.compile(r"b *\+ *y *\+ *p *\+ *a *\+ *s *\+ *s")
+_BENIGN_SPELLING_PREFIX = re.compile(
+    r"(?:the\s+)?spelling\s+(?:example|exercise)\s*",
+)
+_BENIGN_SPELLING_SUFFIX = re.compile(
+    r"\s*(?:demonstrates|illustrates|shows)\s+(?:the\s+)?letter\s+order[.!?]?\s*",
+)
+_BENIGN_EXPRESSION_PREFIX = re.compile(r"(?:the\s+)?(?:expression|formula)\s*")
+_BENIGN_EXPRESSION_SUFFIX = re.compile(
+    r"\s*(?:is|equals)\s+(?:a\s+)?spelling\s+(?:example|exercise)[.!?]?\s*",
+)
 
 
 def _compile_letter_spacing_command_pattern(
@@ -396,12 +411,82 @@ def _spacing_phrase_has_security_signal(phrase: str) -> bool:
     )
 
 
+def _bounded_same_line_context(
+    content: str,
+    start: int,
+    end: int,
+) -> tuple[str, str] | None:
+    """Return complete bounded line context around a short candidate."""
+    prefix_start = max(0, start - _MAX_BENIGN_NOTATION_RUN_CHARS)
+    prefix = content[prefix_start:start]
+    prefix_breaks = tuple(LOGICAL_LINE_BREAK.finditer(prefix))
+    if prefix_breaks:
+        prefix = prefix[prefix_breaks[-1].end() :]
+    elif prefix_start > 0:
+        return None
+
+    suffix_end = min(len(content), end + _MAX_BENIGN_NOTATION_RUN_CHARS)
+    suffix = content[end:suffix_end]
+    suffix_break = LOGICAL_LINE_BREAK.search(suffix)
+    if suffix_break is not None:
+        suffix = suffix[: suffix_break.start()]
+    elif suffix_end < len(content):
+        return None
+    return prefix.casefold(), suffix.casefold()
+
+
+def _spacing_span_is_benign_notation(content: str, span: tuple[int, int]) -> bool:
+    """Recognize narrow, complete spelling/math controls without hiding commands."""
+    start, end = span
+    # The broad concealed-run scanner may retain the first letter of the
+    # ordinary word that follows a spaced run. Exclude that lookahead letter
+    # when the next source character proves the word continues.
+    semantic_end = end - 1 if end < len(content) and content[end].isalpha() else end
+    while semantic_end > start and content[semantic_end - 1] in LINE_BREAK_CHARS:
+        semantic_end -= 1
+    if semantic_end <= start or semantic_end - start > _MAX_BENIGN_NOTATION_RUN_CHARS:
+        return False
+
+    raw_run = content[start:semantic_end]
+    folded_letters: list[str] = []
+    for character in raw_run:
+        if character.isalpha():
+            folded = unicodedata.normalize("NFKC", character).translate(ASCII_CONFUSABLE_SKELETON)
+            folded_letters.extend(value for value in folded.casefold() if value.isalpha())
+    phrase = "".join(folded_letters)
+    if phrase not in _BENIGN_NOTATION_SECURITY_TERMS:
+        return False
+
+    context = _bounded_same_line_context(content, start, semantic_end)
+    if context is None:
+        return False
+    prefix, suffix = context
+
+    if (
+        phrase == "bypass"
+        and _BENIGN_STANDALONE_BYPASS_SUM.fullmatch(raw_run.casefold())
+        and start <= _MAX_BENIGN_NOTATION_RUN_CHARS
+        and len(content) - semantic_end <= _MAX_BENIGN_NOTATION_RUN_CHARS
+        and not content[:start].strip()
+        and not content[semantic_end:].strip(" \t.!?" + LINE_BREAK_CHARS)
+    ):
+        return True
+    return bool(
+        _BENIGN_SPELLING_PREFIX.fullmatch(prefix)
+        and _BENIGN_SPELLING_SUFFIX.fullmatch(suffix)
+        or _BENIGN_EXPRESSION_PREFIX.fullmatch(prefix)
+        and _BENIGN_EXPRESSION_SUFFIX.fullmatch(suffix)
+    )
+
+
 def _spacing_span_has_security_signal(
     content: str,
     span: tuple[int, int],
     budget: _ArtifactIntegrityBudget,
 ) -> bool:
     """Match bounded security semantics without retaining the full run."""
+    if _spacing_span_is_benign_notation(content, span):
+        return False
     overlap = ""
     letters: list[str] = []
     letter_characters = 0
@@ -535,9 +620,22 @@ def _text_signals(
         content.count("\n", 0, spacing_span[0]) + 1 if spacing_span is not None else None
     )
     first_contextual_ignorable_line = _contextual_ignorable_security_line(content, budget)
+    targeted_instruction = next(
+        _obfuscated_instruction_matches(content, budget.check_runtime),
+        None,
+    )
+    first_targeted_instruction_line = (
+        get_line_number(content, targeted_instruction.evidence_offset)
+        if targeted_instruction is not None
+        else None
+    )
     obfuscation_lines = [
         value
-        for value in (first_spacing_line, first_contextual_ignorable_line)
+        for value in (
+            first_spacing_line,
+            first_contextual_ignorable_line,
+            first_targeted_instruction_line,
+        )
         if value is not None
     ]
     first_obfuscation_line = min(obfuscation_lines, default=None)
